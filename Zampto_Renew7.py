@@ -230,9 +230,11 @@ def is_cloudflare_interstitial(sb) -> bool:
     try:
         # 排除已经显示登录表单的情况（说明是内嵌 Turnstile，不是整页挑战）
         has_login_form = sb.execute_script('''
-            return !!(document.querySelector('input[name="identifier"]')
-                   || document.querySelector('input[type="email"]')
-                   || document.querySelector('button[type="submit"]'));
+            (function() { return !!(
+                document.querySelector('input[name="identifier"]')
+                || document.querySelector('input[type="email"]')
+                || document.querySelector('button[type="submit"]'));
+            })()
         ''')
         if has_login_form:
             return False
@@ -261,7 +263,10 @@ def is_cloudflare_interstitial(sb) -> bool:
 
         # 页面内容极少且包含 CF 域名
         body_text_len = sb.execute_script('''
-            return (document.body && document.body.innerText) ? document.body.innerText.trim().length : 0;
+            (function() {
+                return (document.body && document.body.innerText)
+                    ? document.body.innerText.trim().length : 0;
+            })()
         ''')
         if body_text_len < 100 and "challenges.cloudflare.com" in page_source:
             return True
@@ -998,8 +1003,10 @@ def check_renew_modal_open(sb) -> bool:
 def check_turnstile_done(sb) -> bool:
     try:
         return bool(sb.execute_script('''
-            var cf = document.querySelector("input[name='cf-turnstile-response']");
-            return cf && cf.value && cf.value.length > 20;
+            (function() {
+                var cf = document.querySelector("input[name='cf-turnstile-response']");
+                return !!(cf && cf.value && cf.value.length > 20);
+            })()
         '''))
     except:
         return False
@@ -1841,7 +1848,7 @@ def login(sb, user: str, pwd: str, idx: int) -> Tuple[bool, Optional[str]]:
             print("  [INFO] 检测登录前 Turnstile...")
 
             has_ts = sb.execute_script("""
-                return !!(
+                (function() { return !!(
                     document.querySelector(
                         "input[name='cf-turnstile-response']"
                     )
@@ -1861,7 +1868,7 @@ def login(sb, user: str, pwd: str, idx: int) -> Tuple[bool, Optional[str]]:
                     document.querySelector(
                         "textarea[name='g-recaptcha-response']"
                     )
-                );
+                ); })()
             """)
 
             # ==========================================================
@@ -1900,15 +1907,12 @@ def login(sb, user: str, pwd: str, idx: int) -> Tuple[bool, Optional[str]]:
                     time.sleep(3)
 
                     done = sb.execute_script("""
-                        var cf = document.querySelector(
-                            "input[name='cf-turnstile-response']"
-                        );
-
-                        return !!(
-                            cf &&
-                            cf.value &&
-                            cf.value.length > 20
-                        );
+                        (function() {
+                            var cf = document.querySelector(
+                                "input[name='cf-turnstile-response']"
+                            );
+                            return !!(cf && cf.value && cf.value.length > 20);
+                        })()
                     """)
 
                     if done:
