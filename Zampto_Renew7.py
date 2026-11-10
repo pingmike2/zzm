@@ -1272,33 +1272,69 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
             print(f"  [INFO] 弹窗已关闭，续期已提交")
             return True
 
-        # uc_gui 坐标未命中时,用 CDP 直接对 iframe 中心派发可信点击
+        # uc_gui 坐标未命中时,用 CDP 直点 iframe 中心
+        # iframe 可能挂在 closed shadow root 里,JS 摸不到,
+        # 改用 DOMSnapshot.captureSnapshot 取布局盒(无视 open/closed)
         if not cdp_clicked:
             try:
-                box = sb.execute_script('''
-                    (function() {
-                        // turnstile iframe 挂在 shadow DOM 里,需穿透查找
-                        var found = null;
-                        function pierce(root) {
-                            if (found) return;
-                            var els = root.querySelectorAll("*");
-                            for (var i = 0; i < els.length; i++) {
-                                var el = els[i];
-                                if (el.tagName === "IFRAME" &&
-                                    (el.src || "").indexOf("challenges.cloudflare.com") > -1) {
-                                    found = el;
-                                    return;
+                box = None
+                try:
+                    snap = sb.driver.execute_cdp_cmd(
+                        "DOMSnapshot.captureSnapshot", {"computedStyles": []})
+                    strs = snap.get("strings", [])
+                    doc = snap["documents"][0]
+                    nodes = doc["nodes"]
+                    layout = doc["layout"]
+                    tgt = -1
+                    nnames = [strs[i] if isinstance(i, int) and i < len(strs) else ""
+                              for i in nodes["nodeName"]]
+                    for ni in range(len(nnames)):
+                        if nnames[ni] == "IFRAME":
+                            av = nodes["attributes"][ni]
+                            vals = [strs[j] for j in av if isinstance(j, int) and j < len(strs)]
+                            for k in range(0, len(vals) - 1):
+                                if vals[k] == "src" and "challenges.cloudflare.com" in vals[k + 1]:
+                                    tgt = ni
+                                    break
+                            if tgt >= 0:
+                                break
+                    if tgt >= 0 and tgt < len(layout.get("nodeIndex", [])):
+                        li = layout["nodeIndex"].index(tgt)
+                        bounds = layout["bounds"][li]
+                        # bounds = [x, y, w, h]
+                        bx, by, bw, bh = bounds[0], bounds[1], bounds[2], bounds[3]
+                        if bw > 10 and bh > 10:
+                            box = {"x": bx + bw / 2, "y": by + bh / 2,
+                                   "w": bw, "h": bh}
+                except Exception as e:
+                    print(f"  [WARN] DOMSnapshot 失败: {e}")
+
+                if box is None:
+                    # 兜底: 穿透 open shadow root
+                    box = sb.execute_script('''
+                        (function() {
+                            var found = null;
+                            function pierce(root) {
+                                if (found) return;
+                                var els = root.querySelectorAll("*");
+                                for (var i = 0; i < els.length; i++) {
+                                    var el = els[i];
+                                    if (el.tagName === "IFRAME" &&
+                                        (el.src || "").indexOf("challenges.cloudflare.com") > -1) {
+                                        found = el;
+                                        return;
+                                    }
+                                    if (el.shadowRoot) pierce(el.shadowRoot);
                                 }
-                                if (el.shadowRoot) pierce(el.shadowRoot);
                             }
-                        }
-                        pierce(document);
-                        if (!found) return null;
-                        var r = found.getBoundingClientRect();
-                        return {x: r.x + r.width / 2, y: r.y + r.height / 2,
-                                w: r.width, h: r.height};
-                    })()
-                ''')
+                            pierce(document);
+                            if (!found) return null;
+                            var r = found.getBoundingClientRect();
+                            return {x: r.x + r.width / 2, y: r.y + r.height / 2,
+                                    w: r.width, h: r.height};
+                        })()
+                    ''')
+
                 if box and box.get("w", 0) > 10:
                     x, y = box["x"], box["y"]
                     print(f"  [INFO] Turnstile iframe 中心: ({x:.0f},{y:.0f}) {box['w']:.0f}x{box['h']:.0f}")
@@ -1312,6 +1348,8 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
                     if check_turnstile_done(sb):
                         print(f"  [INFO] Turnstile 通过 (CDP 点击,第{attempt+1}次)")
                         return True
+                else:
+                    print("  [DEBUG] 未定位到 turnstile iframe (CDP+shadow 均未命中)")
             except Exception as e:
                 print(f"  [WARN] CDP 点击失败: {e}")
 
