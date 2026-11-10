@@ -33,7 +33,7 @@ jobs:
       - name: 安装依赖
         run: |
           sudo apt-get update && sudo apt-get install -y xvfb unzip ffmpeg
-          pip install seleniumbase>=4.25.0 pyvirtualdisplay>=3.0 requests>=2.31.0 vosk>=0.3.45
+          pip install seleniumbase>=4.25.0 pyvirtualdisplay>=3.0 requests>=2.31.0 vosk>=0.3.45 DrissionPage>=4.1.0 pysocks>=1.7.1
 
       - name: 安装并启动代理
         env:
