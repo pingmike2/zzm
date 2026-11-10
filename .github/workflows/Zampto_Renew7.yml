@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '45 6,18 * * *'  # 每天北京时间 11:45 运行
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'Zampto_Renew7.py'
+      - '.github/workflows/Zampto_Renew7.yml'
 
 jobs:
   renew:
@@ -27,8 +32,8 @@ jobs:
 
       - name: 安装依赖
         run: |
-          sudo apt-get update && sudo apt-get install -y xvfb unzip
-          pip install seleniumbase>=4.25.0 pyvirtualdisplay>=3.0 requests>=2.31.0
+          sudo apt-get update && sudo apt-get install -y xvfb unzip ffmpeg
+          pip install seleniumbase>=4.25.0 pyvirtualdisplay>=3.0 requests>=2.31.0 vosk>=0.3.45
 
       - name: 安装并启动代理
         env:
@@ -310,13 +315,13 @@ jobs:
           PROXY_SOCKS5: ${{ env.PROXY_SOCKS5 }}
         run: python Zampto_Renew7.py
 
-#      - name: 上传截图
-#        uses: actions/upload-artifact@v4
-#        if: always()
-#        with:
-#          name: screenshots-${{ github.run_number }}
-#          path: output/screenshots/
-#          retention-days: 3
+      - name: 上传截图
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshots-${{ github.run_number }}
+          path: output/screenshots/
+          retention-days: 3
 
       - name: 清理旧运行
         uses: Mattraks/delete-workflow-runs@v2

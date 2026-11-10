@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, sys, time, platform, requests, re, signal
+import os, sys, time, platform, requests, re, signal, random
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
@@ -230,9 +230,11 @@ def is_cloudflare_interstitial(sb) -> bool:
     try:
         # 排除已经显示登录表单的情况（说明是内嵌 Turnstile，不是整页挑战）
         has_login_form = sb.execute_script('''
-            return !!(document.querySelector('input[name="identifier"]')
-                   || document.querySelector('input[type="email"]')
-                   || document.querySelector('button[type="submit"]'));
+            (function() { return !!(
+                document.querySelector('input[name="identifier"]')
+                || document.querySelector('input[type="email"]')
+                || document.querySelector('button[type="submit"]'));
+            })()
         ''')
         if has_login_form:
             return False
@@ -261,7 +263,10 @@ def is_cloudflare_interstitial(sb) -> bool:
 
         # 页面内容极少且包含 CF 域名
         body_text_len = sb.execute_script('''
-            return (document.body && document.body.innerText) ? document.body.innerText.trim().length : 0;
+            (function() {
+                return (document.body && document.body.innerText)
+                    ? document.body.innerText.trim().length : 0;
+            })()
         ''')
         if body_text_len < 100 and "challenges.cloudflare.com" in page_source:
             return True
@@ -301,6 +306,659 @@ def bypass_cloudflare_interstitial(sb, idx: int, max_attempts: int = 6) -> bool:
     print("  [ERROR] Cloudflare 整页挑战绕过失败")
     return False
 
+RECAPTCHA_AUDIOES_URL = "https://www.google.com/recaptcha/api2/userverify"
+RECAPTCHA_ANCHOR_RE = r"iframe\[src\*='recaptcha/api2/anchor'\]"
+RECAPTCHA_BFRAME_RE = r"iframe\[src\*='recaptcha/api2/bframe'\]"
+
+VOSK_MODEL_URL = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
+VOSK_MODEL_DIR = Path("/tmp/vosk-model-small-en-us-0.15")
+VOSK_MODEL_ZIP = Path("/tmp/vosk-model-small-en-us-0.15.zip")
+AUDIO_DIR = Path("/tmp/recaptcha_audio")
+
+_NUM_WORDS = {
+    "zero": "0", "oh": "0", "one": "1", "two": "2", "to": "2", "too": "2",
+    "three": "3", "tree": "3", "four": "4", "for": "4", "five": "5",
+    "six": "6", "seven": "7", "eight": "8", "ate": "8", "nine": "9",
+    "ten": "0",
+}
+
+def is_recaptcha_present(sb) -> bool:
+    """检测弹窗内是否为 reCAPTCHA（而不是 Cloudflare Turnstile）。"""
+    try:
+        return bool(sb.execute_script('''
+            (function() {
+                // 1. reCAPTCHA 的 iframe（anchor / bframe / enterprise / 旧版 challenge）
+                var ifr = document.querySelectorAll(
+                    "iframe[src*='recaptcha'], iframe[src*='google.com/recaptcha'], " +
+                    "iframe[title*='reCAPTCHA'], iframe[title*='recaptcha']"
+                );
+                if (ifr.length > 0) return true;
+
+                // 2. 显式容器
+                if (document.querySelector(".g-recaptcha, #g-recaptcha")) return true;
+
+                // 3. 隐藏 token 域（name 或 id 任一命中）
+                if (document.querySelector("textarea[name='g-recaptcha-response']")) return true;
+                if (document.querySelector("textarea[id^='g-recaptcha-response']")) return true;
+                if (document.querySelector("[name='g-recaptcha-response']")) return true;
+
+                // 4. script 已加载 api.js（不能只看 [data-sitekey]：
+                //    Turnstile 容器同样带 data-sitekey，会误判）
+                var s = document.querySelectorAll("script[src*='recaptcha/api.js']");
+                if (s.length > 0 && document.querySelector(".g-recaptcha, #g-recaptcha")) return true;
+
+                // 5. google 域名下与 reCAPTCHA 相关的子 frame（避免误判 maps/analytics/oauth）
+                var all = document.querySelectorAll("iframe");
+                for (var i = 0; i < all.length; i++) {
+                    var src = all[i].src || "";
+                    if (src.indexOf("recaptcha/api") > -1 ||
+                        src.indexOf("recaptcha/enterprise") > -1 ||
+                        src.indexOf("google.com/recaptcha") > -1) return true;
+                }
+
+                return false;
+            })()
+        '''))
+    except Exception:
+        return False
+
+def detect_captcha_kind(sb) -> str:
+    """返回当前验证组件类型：recaptcha / turnstile / none。"""
+    try:
+        kind = sb.execute_script('''
+            (function() {
+                function scan(root) {
+                    var out = { rc: false, ts: false, googleFrame: false };
+                    var frames = root.querySelectorAll ? root.querySelectorAll("iframe") : [];
+                    for (var i = 0; i < frames.length; i++) {
+                        var s = frames[i].src || "";
+                        if (s.indexOf("recaptcha/api") > -1 ||
+                            s.indexOf("recaptcha/enterprise") > -1 ||
+                            s.indexOf("google.com/recaptcha") > -1) out.rc = true;
+                        if (s.indexOf("turnstile") > -1 ||
+                            s.indexOf("challenges.cloudflare.com") > -1) out.ts = true;
+                    }
+                    return out;
+                }
+
+                // 全文档扫描
+                var r = scan(document);
+
+                // 弹窗容器内再扫一遍（组件可能挂在 shadow/自定义弹窗里）
+                var modalSel = [
+                    "#renewModal", "[id*='renew']", "[class*='modal']",
+                    "[role='dialog']", "[class*='dialog']"
+                ];
+                modalSel.forEach(function(sel) {
+                    document.querySelectorAll(sel).forEach(function(m) {
+                        var rr = scan(m);
+                        if (rr.rc) r.rc = true;
+                        if (rr.ts) r.ts = true;
+                    });
+                });
+
+                if (r.rc) return "recaptcha";
+                if (r.ts) return "turnstile";
+
+                // 没有 iframe 时靠 DOM 特征判定
+                if (document.querySelector(".g-recaptcha, #g-recaptcha")) return "recaptcha";
+                if (document.querySelector("textarea[name='g-recaptcha-response']")) return "recaptcha";
+                if (document.querySelector("[name='g-recaptcha-response']")) return "recaptcha";
+                if (document.querySelector("input[name='cf-turnstile-response']")) return "turnstile";
+                if (document.querySelector("[id*='cf-chl-widget']")) return "turnstile";
+                if (document.querySelector("#turnstile-container-renew")) return "turnstile";
+
+                // 文本兜底：reCAPTCHA 的固有文案
+                var txt = document.body ? document.body.innerText : "";
+                if (txt.indexOf("I'm not a robot") > -1 ||
+                    txt.indexOf("reCAPTCHA") > -1 ||
+                    txt.indexOf("Verification challenge") > -1) return "recaptcha";
+
+                return "none";
+            })()
+        ''')
+        return str(kind or "none")
+    except Exception:
+        return "none"
+
+def get_recaptcha_frames(sb) -> Dict[str, str]:
+    """返回 anchor / bframe 两个 iframe 的 src。"""
+    try:
+        return sb.execute_script('''
+            (function() {
+                var a = document.querySelector("iframe[src*='recaptcha/api2/anchor']");
+                var b = document.querySelector("iframe[src*='recaptcha/api2/bframe']");
+                return {
+                    anchor: a ? a.src : "",
+                    bframe: b ? b.src : "",
+                    challenge: document.querySelector("textarea[name='g-recaptcha-response']")
+                        ? document.querySelector("textarea[name='g-recaptcha-response']").value : ""
+                };
+            })()
+        ''') or {}
+    except:
+        return {}
+
+def switch_to_recaptcha_bframe(sb) -> Optional[str]:
+    """
+    给 bframe iframe 加 id，切换到该 frame，返回原始 window handle。
+    之后必须调用 exit_recaptcha_bframe 还原。
+    """
+    try:
+        ok = sb.execute_script('''
+            (function() {
+                var b = document.querySelector("iframe[src*='recaptcha/api2/bframe']");
+                if (!b) return false;
+                b.id = "__rc_bframe__";
+                return true;
+            })()
+        ''')
+        if not ok:
+            print("  [WARN] 未找到 reCAPTCHA bframe")
+            return None
+
+        origin_handle = sb.driver.current_window_handle
+        sb.driver.switch_to.default_content()
+        sb.driver.switch_to.frame(sb.driver.find_element("css selector", "#__rc_bframe__"))
+        time.sleep(0.5)
+        return origin_handle
+    except Exception as e:
+        print(f"  [WARN] 切换到 bframe 失败: {e}")
+        try:
+            sb.driver.switch_to.default_content()
+        except Exception:
+            pass
+        return None
+
+def exit_recaptcha_bframe(sb, origin_handle: Optional[str]):
+    if not origin_handle:
+        return
+    try:
+        sb.driver.switch_to.default_content()
+        sb.driver.switch_to.window(origin_handle)
+    except Exception as e:
+        print(f"  [WARN] 还原 frame 失败: {e}")
+
+def click_recaptcha_audio_button(sb, wait: int = 15) -> bool:
+    """在 bframe 内点击耳机图标切到语音挑战（等元素就绪）。"""
+    js = '''
+        (function() {
+            var ids = ["recaptcha-audio-button", "audio-button"];
+            for (var i = 0; i < ids.length; i++) {
+                var el = document.getElementById(ids[i]);
+                if (el && el.offsetParent !== null) { el.click(); return "id:" + ids[i]; }
+            }
+            var btns = document.querySelectorAll("button, a, div[role='button']");
+            for (var j = 0; j < btns.length; j++) {
+                var t = (btns[j].innerText || "").toLowerCase()
+                      + (btns[j].title || "").toLowerCase()
+                      + (btns[j].getAttribute("aria-label") || "").toLowerCase();
+                if (t.indexOf("audio") > -1 || t.indexOf("voice") > -1) {
+                    btns[j].click();
+                    return "text:audio";
+                }
+            }
+            return "";
+        })()
+    '''
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        try:
+            r = sb.execute_script(js)
+            if r:
+                print(f"  [INFO] 切换到语音验证 ({r})")
+                return True
+        except Exception:
+            pass
+        time.sleep(1)
+
+    print("  [WARN] 未找到语音切换按钮")
+    return False
+
+def get_recaptcha_audio_url(sb, timeout: int = 30) -> Optional[str]:
+    """
+    从 bframe 取音频直链。优先下载链接（tdownload/ndownload），再退 audio 元素。
+    Host2Play 同款选择器：音频经常只在下载链接里，audio 元素可能没有 src。
+    """
+    deadline = time.time() + timeout
+    import html as _html
+
+    while time.time() < deadline:
+        try:
+            info = sb.execute_script('''
+                (function() {
+                    var body = document.body ? document.body.innerText : "";
+                    var blocked =
+                        !!document.querySelector(".rc-doscaptcha-header-text") ||
+                        body.indexOf("Try again later") > -1 ||
+                        body.indexOf("automated queries") > -1;
+
+                    // 1. 下载链接（最可靠）
+                    var link = document.querySelector(".rc-audiochallenge-tdownload-link")
+                            || document.querySelector(".rc-audiochallenge-ndownload-link");
+                    if (link) {
+                        var href = link.getAttribute("href") || "";
+                        if (href.length > 10) return { url: href, blocked: false };
+                    }
+
+                    // 2. audio 元素
+                    var a = document.querySelector("audio#audio-source, audio source, audio");
+                    if (a) {
+                        var src = a.getAttribute("src") || a.src || "";
+                        if (!src) {
+                            var s = a.querySelector("source");
+                            src = s ? (s.getAttribute("src") || s.src || "") : "";
+                        }
+                        if (src.length > 10) return { url: src, blocked: false };
+                    }
+
+                    return { url: "", blocked: blocked };
+                })()
+            ''') or {}
+
+            if info.get("blocked"):
+                print("  [WARN] Google 拒绝了音频请求（自动化判定，需换出口 IP）")
+                return "__BLOCKED__"
+
+            if info.get("url"):
+                return _html.unescape(str(info["url"]))
+        except Exception:
+            pass
+        time.sleep(1)
+    return None
+
+def is_recaptcha_blocked(sb) -> bool:
+    """bframe 内是否出现封禁提示（doscaptcha / 音频错误信息）。"""
+    try:
+        return bool(sb.execute_script('''
+            (function() {
+                var h = document.querySelector(".rc-doscaptcha-header-text");
+                if (h && h.textContent.toLowerCase().indexOf("try again later") > -1) return true;
+                var e = document.querySelector(".rc-audiochallenge-error-message");
+                if (e && e.offsetParent !== null) return true;
+                return false;
+            })()
+        '''))
+    except Exception:
+        return False
+
+def is_audio_mode(sb) -> bool:
+    """bframe 是否已切到语音模式（audio-response 可见）。"""
+    origin_handle = switch_to_recaptcha_bframe(sb)
+    if not origin_handle:
+        return False
+    try:
+        return bool(sb.execute_script('''
+            (function() {
+                var i = document.getElementById("audio-response");
+                return !!(i && i.offsetParent !== null);
+            })()
+        '''))
+    except Exception:
+        return False
+    finally:
+        exit_recaptcha_bframe(sb, origin_handle)
+
+def download_recaptcha_audio(sb, url: str) -> Optional[Path]:
+    """
+    blob: 直链用浏览器内 fetch + FileReader 转 base64 落地；
+    http(s) 直链直接 requests 下载。
+    """
+    AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    out = AUDIO_DIR / f"rc_{int(time.time()*1000)}.mp3"
+
+    if url.startswith("blob:") or url.startswith("data:"):
+        try:
+            b64 = sb.driver.execute_async_script('''
+                var src = arguments[0];
+                var done = arguments[arguments.length - 1];
+                fetch(src)
+                    .then(function(r) { return r.arrayBuffer(); })
+                    .then(function(buf) {
+                        var bytes = new Uint8Array(buf);
+                        var bin = "";
+                        for (var i = 0; i < bytes.length; i++) {
+                            bin += String.fromCharCode(bytes[i]);
+                        }
+                        done(btoa(bin));
+                    })
+                    .catch(function(e) { done(""); });
+            ''', url)
+            if not b64:
+                print("  [WARN] blob 音频读取为空")
+                return None
+            import base64 as _b64
+            out.write_bytes(_b64.b64decode(b64))
+            print(f"  [INFO] 音频已落地 {out.name} ({out.stat().st_size} bytes)")
+            return out
+        except Exception as e:
+            print(f"  [WARN] blob 音频落地失败: {e}")
+            return None
+
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://www.google.com/",
+        }
+        # recaptcha.net / google.com 双域互换重试（Host2Play 同款兜底）
+        urls = [url]
+        if "recaptcha.net" in url:
+            urls.append(url.replace("recaptcha.net", "www.google.com"))
+        elif "google.com" in url:
+            urls.append(url.replace("www.google.com", "recaptcha.net"))
+
+        for audio_url in urls:
+            try:
+                r = requests.get(audio_url, timeout=30, headers=headers)
+                if r.status_code != 200 or len(r.content) < 1000:
+                    continue
+                out.write_bytes(r.content)
+                print(f"  [INFO] 音频已下载 {out.name} ({len(r.content)} bytes)")
+                return out
+            except Exception as e:
+                print(f"  [WARN] 下载失败 {audio_url[:60]}: {e}")
+        return None
+    except Exception as e:
+        print(f"  [WARN] 音频下载异常: {e}")
+        return None
+
+def ensure_vosk_model() -> Optional[str]:
+    """下载并解压 Vosk 小模型（约 40MB），返回模型目录。"""
+    if VOSK_MODEL_DIR.exists() and (VOSK_MODEL_DIR / "am").exists():
+        return str(VOSK_MODEL_DIR)
+
+    if not VOSK_MODEL_ZIP.exists():
+        print("  [INFO] 下载 Vosk 语音模型...")
+        try:
+            with requests.get(VOSK_MODEL_URL, stream=True, timeout=180) as r:
+                r.raise_for_status()
+                with open(VOSK_MODEL_ZIP, "wb") as f:
+                    for chunk in r.iter_content(1 << 16):
+                        f.write(chunk)
+        except Exception as e:
+            print(f"  [WARN] Vosk 模型下载失败: {e}")
+            return None
+
+    try:
+        import zipfile
+        with zipfile.ZipFile(VOSK_MODEL_ZIP) as z:
+            z.extractall("/tmp")
+        print("  [INFO] Vosk 模型解压完成")
+        return str(VOSK_MODEL_DIR)
+    except Exception as e:
+        print(f"  [WARN] Vosk 模型解压失败: {e}")
+        return None
+
+def transcribe_recaptcha_audio(mp3_path: Path) -> str:
+    """mp3 → 16k 单声道 wav → Vosk 识别 → 纯数字串。"""
+    import subprocess, json as _json
+
+    wav = mp3_path.with_suffix(".wav")
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(mp3_path),
+             "-ar", "16000", "-ac", "1", str(wav)],
+            check=True, timeout=60,
+        )
+    except Exception as e:
+        print(f"  [WARN] ffmpeg 转码失败: {e}")
+        return ""
+
+    model_dir = ensure_vosk_model()
+    if not model_dir:
+        return ""
+
+    try:
+        import vosk, wave
+        wf = wave.open(str(wav), "rb")
+        rec = vosk.KaldiRecognizer(vosk.Model(model_dir), wf.getframerate())
+        rec.SetWords(True)
+        while True:
+            data = wf.readframes(4000)
+            if not data:
+                break
+            rec.AcceptWaveform(data)
+        raw = _json.loads(rec.FinalResult()).get("text", "")
+    except Exception as e:
+        print(f"  [WARN] Vosk 识别失败: {e}")
+        return ""
+
+    words = [w.strip(".,!?") for w in raw.lower().split() if w.strip()]
+    digits = "".join(_NUM_WORDS.get(w, "") for w in words)
+    if not digits:
+        # 兜底：识别结果里的裸数字
+        digits = "".join(ch for ch in raw if ch.isdigit())
+
+    print(f"  [INFO] 识别原文: {raw!r} → 数字: {digits or '<空>'}")
+    return digits
+
+def fill_recaptcha_answer(sb, answer: str) -> bool:
+    """在 bframe 里填答案并点验证（click + clear + 填入，Host2Play 同款）。"""
+    js = '''
+        var ans = arguments[0];
+        var inp = document.getElementById("audio-response");
+        if (!inp) return false;
+        inp.focus();
+        inp.value = "";
+        inp.value = ans;
+        inp.dispatchEvent(new Event("input", {bubbles: true}));
+        inp.dispatchEvent(new Event("change", {bubbles: true}));
+        return true;
+    '''
+    js_verify = '''
+        (function() {
+            var btn = document.getElementById("recaptcha-verify-button");
+            if (btn) { btn.click(); return true; }
+            return false;
+        })()
+    '''
+    try:
+        if not sb.execute_script(js, answer):
+            return False
+        time.sleep(random.uniform(0.5, 1.5))
+        return bool(sb.execute_script(js_verify))
+    except Exception as e:
+        print(f"  [WARN] 填写答案异常: {e}")
+        return False
+
+def verify_recaptcha_token(sb) -> bool:
+    """检查主文档 textarea 里是否拿到了 recaptcha token。"""
+    try:
+        return bool(sb.execute_script('''
+            (function() {
+                var t = document.querySelector("textarea[name='g-recaptcha-response']");
+                if (t && t.value && t.value.length > 100) return true;
+                var all = document.querySelectorAll("textarea[id^='g-recaptcha-response']");
+                for (var i = 0; i < all.length; i++) {
+                    if (all[i].value && all[i].value.length > 100) return true;
+                }
+                return false;
+            })()
+        '''))
+    except:
+        return False
+
+def is_recaptcha_challenge_ready(sb) -> bool:
+    """bframe 内是否已经出现挑战元素（图片题或语音面板）。"""
+    origin_handle = switch_to_recaptcha_bframe(sb)
+    if not origin_handle:
+        return False
+    try:
+        return bool(sb.execute_script('''
+            (function() {
+                if (document.getElementById("recaptcha-audio-button")) return true;
+                if (document.getElementById("audio-source")) return true;
+                if (document.getElementById("recaptcha-image-button")) return true;
+                if (document.querySelector(".rc-imageselect-target")) return true;
+                return false;
+            })()
+        '''))
+    except Exception:
+        return False
+    finally:
+        exit_recaptcha_bframe(sb, origin_handle)
+
+def click_recaptcha_anchor(sb) -> bool:
+    """点击 anchor 里的『I'm not a robot』复选框，唤起挑战面板。"""
+    try:
+        origin_handle = sb.driver.current_window_handle
+        ok = sb.execute_script('''
+            (function() {
+                var a = document.querySelector("iframe[src*='recaptcha/api2/anchor']");
+                if (!a) return false;
+                a.id = "__rc_anchor__";
+                return true;
+            })()
+        ''')
+        if not ok:
+            return False
+
+        sb.driver.switch_to.default_content()
+        sb.driver.switch_to.frame(
+            sb.driver.find_element("css selector", "#__rc_anchor__")
+        )
+        clicked = sb.execute_script('''
+            (function() {
+                var c = document.getElementById("recaptcha-anchor");
+                if (c) { c.click(); return true; }
+                var box = document.querySelector(".recaptcha-checkbox-border, #recaptcha-anchor-label");
+                if (box) { box.click(); return true; }
+                return false;
+            })()
+        ''')
+        exit_recaptcha_bframe(sb, origin_handle)
+        if clicked:
+            print("  [INFO] 已点击 reCAPTCHA 复选框")
+        return bool(clicked)
+    except Exception as e:
+        print(f"  [WARN] 点击复选框异常: {e}")
+        try:
+            sb.driver.switch_to.default_content()
+        except Exception:
+            pass
+        return False
+
+def solve_recaptcha_audio(sb, idx: int, max_attempts: int = 3) -> bool:
+    """
+    reCAPTCHA 语音挑战全流程：
+    bframe → 切语音 → 下载 mp3 → Vosk 离线识别 → 回填验证。
+    """
+    print("  [INFO] 检测到 reCAPTCHA，走语音识别通道")
+
+    if verify_recaptcha_token(sb):
+        print("  [INFO] reCAPTCHA token 已存在，无需处理")
+        return True
+
+    # 1. 唤起挑战面板
+    frames = get_recaptcha_frames(sb)
+    if not frames.get("bframe"):
+        click_recaptcha_anchor(sb)
+        time.sleep(3)
+
+    # 面板可能已打开但没有题目内容，先确认 bframe 内有挑战元素
+    if not is_recaptcha_challenge_ready(sb):
+        click_recaptcha_anchor(sb)
+        time.sleep(3)
+
+    for attempt in range(1, max_attempts + 1):
+        print(f"  [INFO] reCAPTCHA 语音尝试 {attempt}/{max_attempts}")
+
+        if is_recaptcha_blocked(sb):
+            print("  [ERROR] bframe 显示封禁提示（Try again later）")
+            return False
+
+        origin_handle = switch_to_recaptcha_bframe(sb)
+        if not origin_handle:
+            return False
+
+        try:
+            if not is_audio_mode(sb):
+                click_recaptcha_audio_button(sb)
+                time.sleep(random.uniform(2, 4))
+                if not is_audio_mode(sb):
+                    print("  [WARN] 未进入语音模式，重试点击")
+                    click_recaptcha_audio_button(sb)
+                    time.sleep(2)
+
+            audio_url = get_recaptcha_audio_url(sb, timeout=25)
+            if audio_url == "__BLOCKED__":
+                exit_recaptcha_bframe(sb, origin_handle)
+                print("  [ERROR] 出口 IP 被 Google 判定为自动化，语音通道不可用")
+                return False
+            if not audio_url:
+                print("  [WARN] 未取到音频链接")
+                exit_recaptcha_bframe(sb, origin_handle)
+                time.sleep(2)
+                continue
+
+            print(f"  [INFO] 音频链接 {(audio_url[:60])}...")
+            path = download_recaptcha_audio(sb, audio_url)
+            exit_recaptcha_bframe(sb, origin_handle)
+            if not path:
+                continue
+
+            answer = transcribe_recaptcha_audio(path)
+            if not answer:
+                print("  [WARN] 识别为空，重新取音频")
+                continue
+
+            # 重新进入 bframe 回填
+            origin_handle = switch_to_recaptcha_bframe(sb)
+            if not origin_handle:
+                return False
+            ok = fill_recaptcha_answer(sb, answer)
+            exit_recaptcha_bframe(sb, origin_handle)
+            if not ok:
+                print("  [WARN] 回填答案失败")
+                continue
+
+            print(f"  [INFO] 已提交答案 {answer}")
+            time.sleep(4)
+
+            if verify_recaptcha_token(sb):
+                print("  [INFO] reCAPTCHA 验证通过")
+                return True
+
+            # 未通过时点一下刷新换题
+            origin_handle = switch_to_recaptcha_bframe(sb)
+            if origin_handle:
+                try:
+                    sb.execute_script('''
+                        (function() {
+                            var b = document.getElementById("recaptcha-reload-button");
+                            if (b) b.click();
+                        })()
+                    ''')
+                except Exception:
+                    pass
+                exit_recaptcha_bframe(sb, origin_handle)
+            time.sleep(3)
+
+        except Exception as e:
+            exit_recaptcha_bframe(sb, origin_handle)
+            print(f"  [WARN] 语音流程异常: {e}")
+            time.sleep(2)
+
+    print("  [WARN] reCAPTCHA 语音验证未通过")
+    return False
+
+def check_turnstile_like_dom(sb) -> bool:
+    """弹窗里是否存在 Turnstile 风格的容器（用于 kind=none 时的兜底）。"""
+    try:
+        return bool(sb.execute_script('''
+            (function() {
+                if (document.querySelector("#turnstile-container-renew")) return true;
+                if (document.querySelector("input[name='cf-turnstile-response']")) return true;
+                if (document.querySelector("[id*='cf-chl-widget']")) return true;
+                var txt = document.body ? document.body.innerText : "";
+                if (txt.indexOf("Renew Server") > -1 &&
+                    txt.indexOf("security verification") > -1) return true;
+                return false;
+            })()
+        '''))
+    except Exception:
+        return False
+
 def check_renew_modal_open(sb) -> bool:
     try:
         return bool(sb.execute_script('''
@@ -316,6 +974,12 @@ def check_renew_modal_open(sb) -> bool:
                     'iframe[src*="turnstile"], iframe[src*="challenges.cloudflare"]'
                 );
                 if (iframes.length > 0) return true;
+
+                // 2b. reCAPTCHA iframe（CF 盾被替换成 RE 盾）
+                var rc = document.querySelectorAll(
+                    'iframe[src*="recaptcha"], .g-recaptcha, textarea[name="g-recaptcha-response"]'
+                );
+                if (rc.length > 0) return true;
 
                 // 3. hidden response（新版已经直接出现 input）
                 var input = document.querySelector(
@@ -339,8 +1003,10 @@ def check_renew_modal_open(sb) -> bool:
 def check_turnstile_done(sb) -> bool:
     try:
         return bool(sb.execute_script('''
-            var cf = document.querySelector("input[name='cf-turnstile-response']");
-            return cf && cf.value && cf.value.length > 20;
+            (function() {
+                var cf = document.querySelector("input[name='cf-turnstile-response']");
+                return !!(cf && cf.value && cf.value.length > 20);
+            })()
         '''))
     except:
         return False
@@ -471,7 +1137,7 @@ def handle_social_prompt(sb, idx: int) -> bool:
         return False
 
 def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
-    print("  [INFO] 等待 Turnstile...")
+    print("  [INFO] 等待验证组件...")
     time.sleep(2)
 
     dismiss_cookie_only(sb)
@@ -480,15 +1146,149 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
     modal_open = check_renew_modal_open(sb)
     print(f"  [INFO] 续期弹窗: {'已打开' if modal_open else '未检测到'}")
 
+    # ==========================================================
+    # 判定验证组件类型（RE 盾 / CF 盾），并留证
+    # page_source 检测最可靠：JS 扫不到 shadow DOM 里的 iframe
+    # ==========================================================
+    try:
+        src = sb.get_page_source() or ""
+    except Exception:
+        src = ""
+    if "challenges.cloudflare.com" in src or "cf-turnstile" in src:
+        kind = "turnstile"
+    elif "recaptcha" in src or "g-recaptcha" in src:
+        kind = "recaptcha"
+    else:
+        kind = detect_captcha_kind(sb)
+    print(f"  [INFO] 验证组件类型: {kind}")
+
+    if kind == "none":
+        # 组件可能还没渲染出来，等一会再判一次
+        time.sleep(4)
+        try:
+            src = sb.get_page_source() or ""
+        except Exception:
+            src = ""
+        if "challenges.cloudflare.com" in src or "cf-turnstile" in src:
+            kind = "turnstile"
+        elif "recaptcha" in src or "g-recaptcha" in src:
+            kind = "recaptcha"
+        else:
+            kind = detect_captcha_kind(sb)
+        print(f"  [INFO] 二次判定: {kind}")
+
+    if kind == "none":
+        # 落盘弹窗 HTML 与 iframe 列表，随 artifact 上传排查
+        try:
+            dump_path = OUTPUT_DIR / f"modal_dump_{sid_f}.html"
+            dump_path.write_text(sb.get_page_source(), encoding="utf-8")
+            print(f"  [DEBUG] 弹窗 HTML 已落盘 {dump_path.name}")
+        except Exception as e:
+            print(f"  [DEBUG] 弹窗 HTML 落盘失败: {e}")
+        try:
+            iframes_info = sb.execute_script('''
+                (function() {
+                    var o = [];
+                    document.querySelectorAll("iframe").forEach(function(f) {
+                        o.push({src: (f.src || "").slice(0, 120),
+                                title: f.title || "", id: f.id || "",
+                                w: f.offsetWidth, h: f.offsetHeight});
+                    });
+                    return o;
+                })()
+            ''') or []
+            for f in iframes_info:
+                print(f"  [DEBUG] iframe: src={f.get('src','')} title={f.get('title','')} {f.get('w')}x{f.get('h')}")
+        except Exception as e:
+            print(f"  [DEBUG] iframe 扫描失败: {e}")
+
+    # ==========================================================
+    # 分支 1：reCAPTCHA（CF 盾已换成 RE 盾）
+    # ==========================================================
+    if kind == "recaptcha":
+        ok = solve_recaptcha_audio(sb, idx, max_attempts=3)
+        safe_screenshot(sb, shot(idx, f"server_{sid_f}_recaptcha"))
+        if ok:
+            return True
+        if not check_renew_modal_open(sb):
+            print("  [INFO] 弹窗已关闭，续期已提交")
+            return True
+
+        # reCAPTCHA 通道失败后，若页面同时具备 Turnstile 特征则回退
+        if check_turnstile_like_dom(sb):
+            print("  [INFO] reCAPTCHA 未通过，检测到 Turnstile 特征，回退点击通道")
+        else:
+            print("  [WARN] reCAPTCHA 语音通道未通过，且无 Turnstile 兜底")
+            return False
+
+    # ==========================================================
+    # 分支 2：Cloudflare Turnstile
+    # kind=none 也走点击通道：截图证实弹窗内是 Turnstile
+    # （可能挂在 shadow DOM，选择器扫不到但 uc 坐标点击有效）
+    # ==========================================================
+    if kind == "none" and not modal_open:
+        print("  [WARN] 未识别到验证组件且弹窗未打开，跳过")
+        return False
+
+    print("  [INFO] 使用 Turnstile 点击通道")
     if check_turnstile_done(sb):
         print("  [INFO] Turnstile 已完成")
         return True
 
+    # 等 widget 真正渲染完成(Loading Cloudflare verification 转成 checkbox)
+    # 最多 30s,每 3s 查一次快照里是否出现 turnstile iframe
+    widget_ready = False
+    for _ in range(10):
+        try:
+            snap = sb.driver.execute_cdp_cmd(
+                "DOMSnapshot.captureSnapshot", {"computedStyles": []})
+            strs = snap["strings"]
+            joined = " ".join(strs)
+            if "challenges.cloudflare.com" in joined:
+                widget_ready = True
+                print("  [INFO] Turnstile widget 已渲染")
+                break
+        except Exception:
+            pass
+        time.sleep(3)
+    if not widget_ready:
+        print("  [WARN] 30s 内 Turnstile widget 未渲染完成")
+
+    # 清掉弹窗外的残留 Turnstile（登录页遗留 iframe 会让
+    # uc_gui_click_captcha 点到隐藏 widget 上，坐标全空转）
+    try:
+        removed = sb.execute_script('''
+            (function() {
+                var n = 0;
+                // 只处理 turnstile 的 iframe；隐藏 token input 天生 0x0,
+                // 绝不能作为删除依据(会连容器一起拔掉)
+                var ifr = document.querySelectorAll(
+                    "iframe[src*='challenges.cloudflare.com']");
+                for (var i = 0; i < ifr.length; i++) {
+                    var el = ifr[i];
+                    var r = el.getBoundingClientRect();
+                    var visible = r.width > 10 && r.height > 10 &&
+                                  r.bottom > 0 && r.top < window.innerHeight;
+                    if (visible) continue;
+                    var box = el.closest("div") || el;
+                    box.remove();
+                    n++;
+                }
+                return n;
+            })()
+        ''')
+        if removed:
+            print(f"  [INFO] 已清理弹窗外残留 Turnstile 节点: {removed} 个")
+    except Exception as e:
+        print(f"  [WARN] 清理残留 Turnstile 失败: {e}")
+
     print("  [INFO] 处理 Turnstile 验证...")
+    cdp_clicked = False
     for attempt in range(3):
         print(f"  [INFO] 坐标计算完成 (第{attempt+1}次)")
         clicked = uc_click_with_timeout(sb, timeout=20)
         time.sleep(3)
+        safe_screenshot(sb, shot(idx, f"ts_attempt_{attempt+1}"))
 
         if check_turnstile_done(sb):
             print(f"  [INFO] Turnstile 通过 (第{attempt+1}次)")
@@ -497,6 +1297,247 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
         if not check_renew_modal_open(sb):
             print(f"  [INFO] 弹窗已关闭，续期已提交")
             return True
+
+        # 点击前: 删掉贴视口底边的登录残留 turnstile widget 容器,
+        # 让页面只剩弹窗一个 widget,uc_gui 定位不再被干扰
+        try:
+            removed = sb.execute_script('''
+                (function() {
+                    var vh = window.innerHeight, n = 0;
+                    var els = document.querySelectorAll(
+                        "[data-sitekey], iframe[src*='challenges.cloudflare.com']"
+                    );
+                    for (var i = 0; i < els.length; i++) {
+                        var el = els[i];
+                        var host = (el.closest && el.closest("[data-sitekey]")) || el;
+                        var r = host.getBoundingClientRect();
+                        if (r.top > vh * 0.8 && r.top + r.height > vh - 120) {
+                            host.remove();
+                            n++;
+                        }
+                    }
+                    return n;
+                })()
+            ''')
+            if removed:
+                print(f"  [INFO] 已删除 {removed} 个贴底残留 turnstile 容器")
+        except Exception as e:
+            print(f"  [WARN] 残留清理失败: {e}")
+
+        # uc_gui 坐标未命中时,用 CDP 直点 iframe 中心
+        # iframe 可能挂在 closed shadow root 里,JS 摸不到,
+        # 改用 DOMSnapshot.captureSnapshot 取布局盒(无视 open/closed)
+        if not cdp_clicked:
+            try:
+                box = None
+                # 首选: CDP DOM.getDocument(pierce:true) 穿透 closed shadow root
+                try:
+                    root = sb.driver.execute_cdp_cmd("DOM.getDocument",
+                                                     {"depth": -1, "pierce": True})
+                    hits = []
+
+                    def walk(node):
+                        nn = node.get("nodeName", "")
+                        if nn == "IFRAME":
+                            attrs = node.get("attributes", [])
+                            for k in range(0, len(attrs) - 1):
+                                if attrs[k] in ("src", "title") and (
+                                        "challenges.cloudflare.com" in attrs[k + 1]
+                                        or "Widget containing" in attrs[k + 1]):
+                                    hits.append(node.get("backendNodeId"))
+                                    break
+                        for ch in node.get("children", []) or []:
+                            walk(ch)
+                        for sc in node.get("shadowRoots", []) or []:
+                            walk(sc)
+
+                    walk(root["root"])
+                    print(f"  [DEBUG] DOM pierce 命中 CF iframe: {len(hits)}")
+                    for bid in hits:
+                        try:
+                            bm = sb.driver.execute_cdp_cmd(
+                                "DOM.getBoxModel", {"backendNodeId": bid})
+                            q = bm["model"]["content"]
+                            xs, ys = q[0::2], q[1::2]
+                            x0, x1 = min(xs), max(xs)
+                            y0, y1 = min(ys), max(ys)
+                            w, h = x1 - x0, y1 - y0
+                            print(f"  [DEBUG] pierce iframe box=({x0:.0f},{y0:.0f}) {w:.0f}x{h:.0f}")
+                            if w > 50 and h > 20:
+                                box = {"x": x0 + 30, "y": y0 + h / 2,
+                                       "w": w, "h": h, "tag": "pierce"}
+                                break
+                        except Exception:
+                            continue
+                except Exception as e:
+                    print(f"  [WARN] DOM pierce 失败: {e}")
+                # 次选: 轻 DOM 容器 rect(视口坐标);收集全部候选并打印
+                try:
+                    cands = sb.execute_script('''
+                        (function() {
+                            var out = [];
+                            var els = document.querySelectorAll(
+                                "#turnstile-container-renew, [class*='cf-turnstile'], [id*='cf-chl-widget'], [data-sitekey]"
+                            );
+                            for (var i = 0; i < els.length; i++) {
+                                var r = els[i].getBoundingClientRect();
+                                out.push({
+                                    x: r.x, y: r.y, w: r.width, h: r.height,
+                                    tag: (els[i].id || els[i].className || els[i].tagName).slice(0, 40)
+                                });
+                            }
+                            return out;
+                        })()
+                    ''') or []
+                except Exception:
+                    cands = []
+                if cands:
+                    vh = None
+                    for c in cands:
+                        print(f"  [DEBUG] 容器候选: {c.get('tag','')} rect=({c['x']:.0f},{c['y']:.0f}) {c['w']:.0f}x{c['h']:.0f}")
+                    if cands and isinstance(cands, list):
+                        try:
+                            vh = sb.execute_script('''
+                                (function() { return window.innerHeight; })()
+                            ''')
+                        except Exception:
+                            vh = None
+                    for c in (cands if isinstance(cands, list) else []):
+                        # 排除贴视口底边的登录残留 + 0 尺寸隐藏节点
+                        if vh and c["y"] + c["h"] > vh - 10:
+                            continue
+                        if c["w"] <= 50 or c["h"] <= 20:
+                            continue
+                        box = {"x": c["x"] + 30, "y": c["y"] + c["h"] / 2,
+                               "w": c["w"], "h": c["h"], "tag": "container"}
+                        break
+                if box is None or box.get("w", 0) <= 10:
+                    # 次选: DOMSnapshot 快照扫全部 document,按 src 或 title 匹配
+                    try:
+                        snap = sb.driver.execute_cdp_cmd(
+                            "DOMSnapshot.captureSnapshot", {"computedStyles": []})
+                        strs = snap["strings"]
+                        try:
+                            vh_ = sb.execute_script('''
+                                (function() { return window.innerHeight; })()
+                            ''')
+                        except Exception:
+                            vh_ = None
+                        best = None
+                        ndocs = len(snap.get("documents", []))
+                        print(f"  [DEBUG] 快照 document 数: {ndocs}")
+                        for di in range(ndocs):
+                            doc = snap["documents"][di]
+                            nodes = doc["nodes"]
+                            layout = doc["layout"]
+                            nnames = [strs[i] if isinstance(i, int) and i < len(strs)
+                                      else "" for i in nodes["nodeName"]]
+                            for ni in range(len(nnames)):
+                                if nnames[ni] != "IFRAME":
+                                    continue
+                                vals = [strs[j] for j in nodes["attributes"][ni]
+                                        if isinstance(j, int) and j < len(strs)]
+                                is_cf = 0
+                                for k in range(0, len(vals) - 1):
+                                    if vals[k] == "src" and "challenges.cloudflare.com" in vals[k + 1]:
+                                        is_cf = max(is_cf, 2)
+                                    if vals[k] == "title" and "Widget containing" in vals[k + 1]:
+                                        is_cf = max(is_cf, 2)
+                                    if vals[k] == "src" and vals[k + 1] in ("about:blank", ""):
+                                        is_cf = max(is_cf, 1)
+                                if is_cf == 0 or ni not in layout["nodeIndex"]:
+                                    continue
+                                b = layout["bounds"][layout["nodeIndex"].index(ni)]
+                                # 排除贴视口底边的登录残留 iframe
+                                if vh_ and b[1] + b[3] > vh_ - 10:
+                                    continue
+                                area = b[2] * b[3]
+                                if area > 100:
+                                    score = is_cf * 1000000 + area
+                                    if best is None or score > best[0]:
+                                        best = (score, b, di, is_cf)
+                        if best:
+                            b, di = best[1], best[2]
+                            print(f"  [DEBUG] 快照候选 doc#{di} bounds={b}")
+                            try:
+                                sc = sb.execute_script('''
+                                    (function() {
+                                        return {x: window.scrollX || 0,
+                                                y: window.scrollY || 0};
+                                    })()
+                                ''') or {}
+                            except Exception:
+                                sc = {}
+                            box = {"x": b[0] + b[2] / 2 - sc.get("x", 0),
+                                   "y": b[1] + b[3] / 2 - sc.get("y", 0),
+                                   "w": b[2], "h": b[3], "tag": "snapshot"}
+                    except Exception as e:
+                        print(f"  [WARN] DOMSnapshot 失败: {e}")
+                if box is None:
+                    # 兜底: 穿透 open shadow root
+                    box = sb.execute_script('''
+                        (function() {
+                            var found = null;
+                            function pierce(root) {
+                                if (found) return;
+                                var els = root.querySelectorAll("*");
+                                for (var i = 0; i < els.length; i++) {
+                                    var el = els[i];
+                                    if (el.tagName === "IFRAME" &&
+                                        (el.src || "").indexOf("challenges.cloudflare.com") > -1) {
+                                        found = el;
+                                        return;
+                                    }
+                                    if (el.shadowRoot) pierce(el.shadowRoot);
+                                }
+                            }
+                            pierce(document);
+                            if (!found) return null;
+                            var r = found.getBoundingClientRect();
+                            return {x: r.x + r.width / 2, y: r.y + r.height / 2,
+                                    w: r.width, h: r.height};
+                        })()
+                    ''')
+
+                if box and box.get("w", 0) > 10:
+                    x, y = box["x"], box["y"]
+                    print(f"  [INFO] 点击目标({box.get('tag','?')}): ({x:.0f},{y:.0f}) {box['w']:.0f}x{box['h']:.0f}")
+                    for t_ in ("mousePressed", "mouseReleased"):
+                        sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                            "type": t_, "x": x, "y": y,
+                            "button": "left", "clickCount": 1})
+                    cdp_clicked = True
+                    time.sleep(3)
+                    safe_screenshot(sb, shot(idx, f"ts_cdp_{attempt+1}"))
+                    if check_turnstile_done(sb):
+                        print(f"  [INFO] Turnstile 通过 (CDP 点击,第{attempt+1}次)")
+                        return True
+                else:
+                    print("  [DEBUG] 未定位到 turnstile 点击目标")
+                    try:
+                        snap2 = sb.driver.execute_cdp_cmd(
+                            "DOMSnapshot.captureSnapshot", {"computedStyles": []})
+                        s2 = snap2["strings"]; d2 = snap2["documents"][0]
+                        n2 = d2["nodes"]
+                        nms = [s2[i] if isinstance(i, int) and i < len(s2) else ""
+                               for i in n2["nodeName"]]
+                        icount = 0
+                        for ni in range(len(nms)):
+                            if nms[ni] == "IFRAME":
+                                icount += 1
+                                vals = [s2[j] for j in n2["attributes"][ni]
+                                        if isinstance(j, int) and j < len(s2)]
+                                src = ""
+                                for k in range(0, len(vals) - 1):
+                                    if vals[k] == "src":
+                                        src = vals[k + 1][:100]
+                                        break
+                                print(f"  [DEBUG] 快照 iframe#{icount}: src={src!r} attrs={vals[:10]}")
+                        print(f"  [DEBUG] 快照 iframe 总数: {icount}, document 数: {len(snap2.get('documents', []))}")
+                    except Exception as e:
+                        print(f"  [DEBUG] 快照诊断失败: {e}")
+            except Exception as e:
+                print(f"  [WARN] CDP 点击失败: {e}")
 
         if not clicked:
             time.sleep(5)
@@ -673,13 +1714,25 @@ def login(sb, user: str, pwd: str, idx: int) -> Tuple[bool, Optional[str]]:
     print("  [INFO] 验证出口 IP...")
 
     try:
+        proxy_env = os.environ.get("PROXY_SOCKS5", "")
+        _px = {"http": proxy_env, "https": proxy_env} if proxy_env else None
         ip_info = requests.get(
             "https://api.ipify.org?format=json",
+            proxies=_px,
             timeout=10
         ).json()
-        print(f"  [INFO] 出口IP确认: {ip_info}")
+        print(f"  [INFO] requests 出口IP: {ip_info}")
     except Exception:
         pass
+
+    # 浏览器级出口验证: UC Chrome 是否真走了代理,以此为准
+    try:
+        sb.open("https://api.ipify.org?format=json")
+        time.sleep(2)
+        browser_ip = sb.get_text("body").strip()[:200]
+        print(f"  [INFO] 浏览器出口IP: {browser_ip}")
+    except Exception as e:
+        print(f"  [WARN] 浏览器出口IP获取失败: {e}")
 
     print(f"\n{'─' * 40}")
     print("  [INFO] 访问登录页...")
@@ -933,7 +1986,7 @@ def login(sb, user: str, pwd: str, idx: int) -> Tuple[bool, Optional[str]]:
             print("  [INFO] 检测登录前 Turnstile...")
 
             has_ts = sb.execute_script("""
-                return !!(
+                (function() { return !!(
                     document.querySelector(
                         "input[name='cf-turnstile-response']"
                     )
@@ -945,18 +1998,40 @@ def login(sb, user: str, pwd: str, idx: int) -> Tuple[bool, Optional[str]]:
                     document.querySelector(
                         "[id*='cf-chl-widget']"
                     )
-                );
+                    ||
+                    document.querySelector(
+                        "iframe[src*='recaptcha']"
+                    )
+                    ||
+                    document.querySelector(
+                        "textarea[name='g-recaptcha-response']"
+                    )
+                ); })()
             """)
 
             # ==========================================================
-            # 处理 Turnstile
+            # 处理 Turnstile / reCAPTCHA
             # ==========================================================
-            if has_ts:
-                print("  [INFO] 检测到 Turnstile，尝试处理...")
+            kind_is_recaptcha = False
+            try:
+                src = sb.get_page_source() or ""
+            except Exception:
+                src = ""
+            if "recaptcha" in src or "g-recaptcha" in src:
+                kind_is_recaptcha = True
+
+            if has_ts or kind_is_recaptcha:
+                print("  [INFO] 检测到验证组件，尝试处理...")
 
                 turnstile_done = False
 
-                for t_attempt in range(3):
+                # reCAPTCHA 优先走语音识别通道
+                if kind_is_recaptcha:
+                    turnstile_done = solve_recaptcha_audio(sb, idx, max_attempts=3)
+                    if turnstile_done:
+                        print("  [INFO] reCAPTCHA 已通过（语音通道）")
+
+                for t_attempt in range(3 if not turnstile_done else 0):
                     print(
                         f"  [INFO] Turnstile 点击 "
                         f"({t_attempt + 1}/3)"
@@ -970,15 +2045,12 @@ def login(sb, user: str, pwd: str, idx: int) -> Tuple[bool, Optional[str]]:
                     time.sleep(3)
 
                     done = sb.execute_script("""
-                        var cf = document.querySelector(
-                            "input[name='cf-turnstile-response']"
-                        );
-
-                        return !!(
-                            cf &&
-                            cf.value &&
-                            cf.value.length > 20
-                        );
+                        (function() {
+                            var cf = document.querySelector(
+                                "input[name='cf-turnstile-response']"
+                            );
+                            return !!(cf && cf.value && cf.value.length > 20);
+                        })()
                     """)
 
                     if done:
