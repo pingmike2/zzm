@@ -884,6 +884,15 @@ def solve_recaptcha_audio(sb, idx: int, max_attempts: int = 3) -> bool:
         return None
 
     def is_solved():
+        # token 回填在主文档表单里,必须先查主文档(只扫 iframe 会误判未通过)
+        try:
+            tok = page.run_js(
+                'return document.querySelector('
+                '"textarea[name=\'g-recaptcha-response\']")?.value')
+            if tok and len(str(tok)) > 30:
+                return True
+        except Exception:
+            pass
         try:
             for f in page.get_frames():
                 try:
