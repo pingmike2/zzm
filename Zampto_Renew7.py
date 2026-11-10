@@ -1234,18 +1234,20 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
         removed = sb.execute_script('''
             (function() {
                 var n = 0;
-                var sel = "input[name='cf-turnstile-response'], " +
-                          "[id*='cf-chl-widget'], .cf-turnstile, " +
-                          "iframe[src*='challenges.cloudflare.com']";
-                document.querySelectorAll(sel).forEach(function(el) {
+                // 只处理 turnstile 的 iframe；隐藏 token input 天生 0x0,
+                // 绝不能作为删除依据(会连容器一起拔掉)
+                var ifr = document.querySelectorAll(
+                    "iframe[src*='challenges.cloudflare.com']");
+                for (var i = 0; i < ifr.length; i++) {
+                    var el = ifr[i];
                     var r = el.getBoundingClientRect();
                     var visible = r.width > 10 && r.height > 10 &&
                                   r.bottom > 0 && r.top < window.innerHeight;
-                    if (visible) return;
+                    if (visible) continue;
                     var box = el.closest("div") || el;
                     box.remove();
                     n++;
-                });
+                }
                 return n;
             })()
         ''')
