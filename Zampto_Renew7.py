@@ -337,9 +337,10 @@ def is_recaptcha_present(sb) -> bool:
                 if (document.querySelector("textarea[id^='g-recaptcha-response']")) return true;
                 if (document.querySelector("[name='g-recaptcha-response']")) return true;
 
-                // 4. script 已加载 api.js
+                // 4. script 已加载 api.js（不能只看 [data-sitekey]：
+                //    Turnstile 容器同样带 data-sitekey，会误判）
                 var s = document.querySelectorAll("script[src*='recaptcha/api.js']");
-                if (s.length > 0 && document.querySelector("[data-sitekey]")) return true;
+                if (s.length > 0 && document.querySelector(".g-recaptcha, #g-recaptcha")) return true;
 
                 // 5. google 域名下与 reCAPTCHA 相关的子 frame（避免误判 maps/analytics/oauth）
                 var all = document.querySelectorAll("iframe");
@@ -1197,7 +1198,7 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
     # ==========================================================
     # 分支 1：reCAPTCHA（CF 盾已换成 RE 盾）
     # ==========================================================
-    if kind == "recaptcha" or is_recaptcha_present(sb):
+    if kind == "recaptcha":
         ok = solve_recaptcha_audio(sb, idx, max_attempts=3)
         safe_screenshot(sb, shot(idx, f"server_{sid_f}_recaptcha"))
         if ok:
@@ -1725,13 +1726,21 @@ def login(sb, user: str, pwd: str, idx: int) -> Tuple[bool, Optional[str]]:
             # ==========================================================
             # 处理 Turnstile / reCAPTCHA
             # ==========================================================
-            if has_ts or is_recaptcha_present(sb):
+            kind_is_recaptcha = False
+            try:
+                src = sb.get_page_source() or ""
+            except Exception:
+                src = ""
+            if "recaptcha" in src or "g-recaptcha" in src:
+                kind_is_recaptcha = True
+
+            if has_ts or kind_is_recaptcha:
                 print("  [INFO] 检测到验证组件，尝试处理...")
 
                 turnstile_done = False
 
                 # reCAPTCHA 优先走语音识别通道
-                if is_recaptcha_present(sb):
+                if kind_is_recaptcha:
                     turnstile_done = solve_recaptcha_audio(sb, idx, max_attempts=3)
                     if turnstile_done:
                         print("  [INFO] reCAPTCHA 已通过（语音通道）")
