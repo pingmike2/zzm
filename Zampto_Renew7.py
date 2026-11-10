@@ -1304,19 +1304,47 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
         if not cdp_clicked:
             try:
                 box = None
-                # 首选: 轻 DOM 容器 #turnstile-container-renew 的 rect
+                # 首选: 轻 DOM 容器 rect(视口坐标,最准);收集全部候选并打印
                 try:
-                    box = sb.execute_script('''
+                    cands = sb.execute_script('''
                         (function() {
-                            var c = document.querySelector("#turnstile-container-renew");
-                            if (!c) return null;
-                            var r = c.getBoundingClientRect();
-                            return {x: r.x + r.width / 2, y: r.y + r.height / 2,
-                                    w: r.width, h: r.height, tag: "container"};
+                            var out = [];
+                            var els = document.querySelectorAll(
+                                "#turnstile-container-renew, [class*='cf-turnstile'], [id*='cf-chl-widget']"
+                            );
+                            for (var i = 0; i < els.length; i++) {
+                                var r = els[i].getBoundingClientRect();
+                                if (r.width > 50 && r.height > 20) {
+                                    out.push({
+                                        x: r.x, y: r.y, w: r.width, h: r.height,
+                                        tag: els[i].id || els[i].className
+                                    });
+                                }
+                            }
+                            out.vh = window.innerHeight;
+                            return out;
                         })()
-                    ''')
+                    ''') or []
                 except Exception:
-                    box = None
+                    cands = []
+                if cands:
+                    vh = None
+                    for c in cands:
+                        print(f"  [DEBUG] 容器候选: {c.get('tag','')} rect=({c['x']:.0f},{c['y']:.0f}) {c['w']:.0f}x{c['h']:.0f}")
+                    if cands and isinstance(cands, list):
+                        try:
+                            vh = sb.execute_script('''
+                                (function() { return window.innerHeight; })()
+                            ''')
+                        except Exception:
+                            vh = None
+                    for c in (cands if isinstance(cands, list) else []):
+                        # 排除贴视口底边的登录残留
+                        if vh and c["y"] + c["h"] > vh - 10:
+                            continue
+                        box = {"x": c["x"] + 30, "y": c["y"] + c["h"] / 2,
+                               "w": c["w"], "h": c["h"], "tag": "container"}
+                        break
                 if box is None or box.get("w", 0) <= 10:
                     # 次选: DOMSnapshot 快照里挑面积最大的 turnstile iframe
                     try:
@@ -1341,6 +1369,15 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
                                 continue
                             b = layout["bounds"][layout["nodeIndex"].index(ni)]
                             area = b[2] * b[3]
+                            # 排除贴视口底边的登录残留 iframe
+                            try:
+                                vh_ = sb.execute_script('''
+                                    (function() { return window.innerHeight; })()
+                                ''')
+                            except Exception:
+                                vh_ = None
+                            if vh_ and b[1] + b[3] > vh_ - 10:
+                                continue
                             if best is None or area > best[0]:
                                 best = (area, b)
                         if best and best[0] > 100:
