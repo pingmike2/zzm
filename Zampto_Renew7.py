@@ -1298,6 +1298,32 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
             print(f"  [INFO] 弹窗已关闭，续期已提交")
             return True
 
+        # 点击前: 删掉贴视口底边的登录残留 turnstile widget 容器,
+        # 让页面只剩弹窗一个 widget,uc_gui 定位不再被干扰
+        try:
+            removed = sb.execute_script('''
+                (function() {
+                    var vh = window.innerHeight, n = 0;
+                    var els = document.querySelectorAll(
+                        "[data-sitekey], iframe[src*='challenges.cloudflare.com']"
+                    );
+                    for (var i = 0; i < els.length; i++) {
+                        var el = els[i];
+                        var host = (el.closest && el.closest("[data-sitekey]")) || el;
+                        var r = host.getBoundingClientRect();
+                        if (r.top + r.height > vh - 10 && r.top > vh / 2) {
+                            host.remove();
+                            n++;
+                        }
+                    }
+                    return n;
+                })()
+            ''')
+            if removed:
+                print(f"  [INFO] 已删除 {removed} 个贴底残留 turnstile 容器")
+        except Exception as e:
+            print(f"  [WARN] 残留清理失败: {e}")
+
         # uc_gui 坐标未命中时,用 CDP 直点 iframe 中心
         # iframe 可能挂在 closed shadow root 里,JS 摸不到,
         # 改用 DOMSnapshot.captureSnapshot 取布局盒(无视 open/closed)
@@ -1376,7 +1402,7 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
                                         is_cf = max(is_cf, 2)
                                     if vals[k] == "title" and "Widget containing" in vals[k + 1]:
                                         is_cf = max(is_cf, 2)
-                                    if vals[k] == "src" and vals[k + 1] == "about:blank":
+                                    if vals[k] == "src" and vals[k + 1] in ("about:blank", ""):
                                         is_cf = max(is_cf, 1)
                                 if is_cf == 0 or ni not in layout["nodeIndex"]:
                                     continue
@@ -1465,8 +1491,8 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
                                     if vals[k] == "src":
                                         src = vals[k + 1][:100]
                                         break
-                                print(f"  [DEBUG] 快照 iframe#{icount}: src={src!r}")
-                        print(f"  [DEBUG] 快照 iframe 总数: {icount}")
+                                print(f"  [DEBUG] 快照 iframe#{icount}: src={src!r} attrs={vals[:10]}")
+                        print(f"  [DEBUG] 快照 iframe 总数: {icount}, document 数: {len(snap2.get('documents', []))}")
                     except Exception as e:
                         print(f"  [DEBUG] 快照诊断失败: {e}")
             except Exception as e:
