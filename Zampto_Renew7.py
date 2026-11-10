@@ -1304,37 +1304,51 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
         if not cdp_clicked:
             try:
                 box = None
+                # 首选: 轻 DOM 容器 #turnstile-container-renew 的 rect
                 try:
-                    snap = sb.driver.execute_cdp_cmd(
-                        "DOMSnapshot.captureSnapshot", {"computedStyles": []})
-                    strs = snap.get("strings", [])
-                    doc = snap["documents"][0]
-                    nodes = doc["nodes"]
-                    layout = doc["layout"]
-                    tgt = -1
-                    nnames = [strs[i] if isinstance(i, int) and i < len(strs) else ""
-                              for i in nodes["nodeName"]]
-                    for ni in range(len(nnames)):
-                        if nnames[ni] == "IFRAME":
-                            av = nodes["attributes"][ni]
-                            vals = [strs[j] for j in av if isinstance(j, int) and j < len(strs)]
-                            for k in range(0, len(vals) - 1):
-                                if vals[k] == "src" and "challenges.cloudflare.com" in vals[k + 1]:
-                                    tgt = ni
-                                    break
-                            if tgt >= 0:
-                                break
-                    if tgt >= 0 and tgt < len(layout.get("nodeIndex", [])):
-                        li = layout["nodeIndex"].index(tgt)
-                        bounds = layout["bounds"][li]
-                        # bounds = [x, y, w, h]
-                        bx, by, bw, bh = bounds[0], bounds[1], bounds[2], bounds[3]
-                        if bw > 10 and bh > 10:
-                            box = {"x": bx + bw / 2, "y": by + bh / 2,
-                                   "w": bw, "h": bh}
-                except Exception as e:
-                    print(f"  [WARN] DOMSnapshot 失败: {e}")
-
+                    box = sb.execute_script('''
+                        (function() {
+                            var c = document.querySelector("#turnstile-container-renew");
+                            if (!c) return null;
+                            var r = c.getBoundingClientRect();
+                            return {x: r.x + r.width / 2, y: r.y + r.height / 2,
+                                    w: r.width, h: r.height, tag: "container"};
+                        })()
+                    ''')
+                except Exception:
+                    box = None
+                if box is None or box.get("w", 0) <= 10:
+                    # 次选: DOMSnapshot 快照里挑面积最大的 turnstile iframe
+                    try:
+                        snap = sb.driver.execute_cdp_cmd(
+                            "DOMSnapshot.captureSnapshot", {"computedStyles": []})
+                        strs = snap["strings"]
+                        doc = snap["documents"][0]
+                        nodes = doc["nodes"]
+                        layout = doc["layout"]
+                        nnames = [strs[i] if isinstance(i, int) and i < len(strs) else ""
+                                  for i in nodes["nodeName"]]
+                        best = None
+                        for ni in range(len(nnames)):
+                            if nnames[ni] != "IFRAME":
+                                continue
+                            vals = [strs[j] for j in nodes["attributes"][ni]
+                                    if isinstance(j, int) and j < len(strs)]
+                            is_cf = any(vals[k] == "src" and
+                                        "challenges.cloudflare.com" in vals[k + 1]
+                                        for k in range(0, len(vals) - 1))
+                            if not is_cf or ni not in layout["nodeIndex"]:
+                                continue
+                            b = layout["bounds"][layout["nodeIndex"].index(ni)]
+                            area = b[2] * b[3]
+                            if best is None or area > best[0]:
+                                best = (area, b)
+                        if best and best[0] > 100:
+                            b = best[1]
+                            box = {"x": b[0] + b[2] / 2, "y": b[1] + b[3] / 2,
+                                   "w": b[2], "h": b[3], "tag": "snapshot"}
+                    except Exception as e:
+                        print(f"  [WARN] DOMSnapshot 失败: {e}")
                 if box is None:
                     # 兜底: 穿透 open shadow root
                     box = sb.execute_script('''
@@ -1363,7 +1377,7 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
 
                 if box and box.get("w", 0) > 10:
                     x, y = box["x"], box["y"]
-                    print(f"  [INFO] Turnstile iframe 中心: ({x:.0f},{y:.0f}) {box['w']:.0f}x{box['h']:.0f}")
+                    print(f"  [INFO] 点击目标({box.get('tag','?')}): ({x:.0f},{y:.0f}) {box['w']:.0f}x{box['h']:.0f}")
                     for t_ in ("mousePressed", "mouseReleased"):
                         sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
                             "type": t_, "x": x, "y": y,
@@ -1375,7 +1389,7 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
                         print(f"  [INFO] Turnstile 通过 (CDP 点击,第{attempt+1}次)")
                         return True
                 else:
-                    print("  [DEBUG] 未定位到 turnstile iframe (CDP+shadow 均未命中)")
+                    print("  [DEBUG] 未定位到 turnstile 点击目标")
                     try:
                         snap2 = sb.driver.execute_cdp_cmd(
                             "DOMSnapshot.captureSnapshot", {"computedStyles": []})
