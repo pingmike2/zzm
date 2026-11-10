@@ -322,15 +322,98 @@ def is_recaptcha_present(sb) -> bool:
     try:
         return bool(sb.execute_script('''
             return (function() {
-                if (document.querySelector("iframe[src*='recaptcha']")) return true;
+                // 1. reCAPTCHA 的 iframe（anchor / bframe / enterprise / 旧版 challenge）
+                var ifr = document.querySelectorAll(
+                    "iframe[src*='recaptcha'], iframe[src*='google.com/recaptcha'], " +
+                    "iframe[title*='reCAPTCHA'], iframe[title*='recaptcha']"
+                );
+                if (ifr.length > 0) return true;
+
+                // 2. 显式容器
                 if (document.querySelector(".g-recaptcha, #g-recaptcha")) return true;
+
+                // 3. 隐藏 token 域（name 或 id 任一命中）
                 if (document.querySelector("textarea[name='g-recaptcha-response']")) return true;
                 if (document.querySelector("textarea[id^='g-recaptcha-response']")) return true;
+                if (document.querySelector("[name='g-recaptcha-response']")) return true;
+
+                // 4. script 已加载 api.js
+                var s = document.querySelectorAll("script[src*='recaptcha/api.js']");
+                if (s.length > 0 && document.querySelector("[data-sitekey]")) return true;
+
+                // 5. google 域名下与 reCAPTCHA 相关的子 frame（避免误判 maps/analytics/oauth）
+                var all = document.querySelectorAll("iframe");
+                for (var i = 0; i < all.length; i++) {
+                    var src = all[i].src || "";
+                    if (src.indexOf("recaptcha/api") > -1 ||
+                        src.indexOf("recaptcha/enterprise") > -1 ||
+                        src.indexOf("google.com/recaptcha") > -1) return true;
+                }
+
                 return false;
             })()
         '''))
-    except:
+    except Exception:
         return False
+
+def detect_captcha_kind(sb) -> str:
+    """返回当前验证组件类型：recaptcha / turnstile / none。"""
+    try:
+        kind = sb.execute_script('''
+            return (function() {
+                function scan(root) {
+                    var out = { rc: false, ts: false, googleFrame: false };
+                    var frames = root.querySelectorAll ? root.querySelectorAll("iframe") : [];
+                    for (var i = 0; i < frames.length; i++) {
+                        var s = frames[i].src || "";
+                        if (s.indexOf("recaptcha/api") > -1 ||
+                            s.indexOf("recaptcha/enterprise") > -1 ||
+                            s.indexOf("google.com/recaptcha") > -1) out.rc = true;
+                        if (s.indexOf("turnstile") > -1 ||
+                            s.indexOf("challenges.cloudflare.com") > -1) out.ts = true;
+                    }
+                    return out;
+                }
+
+                // 全文档扫描
+                var r = scan(document);
+
+                // 弹窗容器内再扫一遍（组件可能挂在 shadow/自定义弹窗里）
+                var modalSel = [
+                    "#renewModal", "[id*='renew']", "[class*='modal']",
+                    "[role='dialog']", "[class*='dialog']"
+                ];
+                modalSel.forEach(function(sel) {
+                    document.querySelectorAll(sel).forEach(function(m) {
+                        var rr = scan(m);
+                        if (rr.rc) r.rc = true;
+                        if (rr.ts) r.ts = true;
+                    });
+                });
+
+                if (r.rc) return "recaptcha";
+                if (r.ts) return "turnstile";
+
+                // 没有 iframe 时靠 DOM 特征判定
+                if (document.querySelector(".g-recaptcha, #g-recaptcha")) return "recaptcha";
+                if (document.querySelector("textarea[name='g-recaptcha-response']")) return "recaptcha";
+                if (document.querySelector("[name='g-recaptcha-response']")) return "recaptcha";
+                if (document.querySelector("input[name='cf-turnstile-response']")) return "turnstile";
+                if (document.querySelector("[id*='cf-chl-widget']")) return "turnstile";
+                if (document.querySelector("#turnstile-container-renew")) return "turnstile";
+
+                // 文本兜底：reCAPTCHA 的固有文案
+                var txt = document.body ? document.body.innerText : "";
+                if (txt.indexOf("I'm not a robot") > -1 ||
+                    txt.indexOf("reCAPTCHA") > -1 ||
+                    txt.indexOf("Verification challenge") > -1) return "recaptcha";
+
+                return "none";
+            })()
+        ''')
+        return str(kind or "none")
+    except Exception:
+        return "none"
 
 def get_recaptcha_frames(sb) -> Dict[str, str]:
     """返回 anchor / bframe 两个 iframe 的 src。"""
@@ -772,6 +855,23 @@ def solve_recaptcha_audio(sb, idx: int, max_attempts: int = 3) -> bool:
     print("  [WARN] reCAPTCHA 语音验证未通过")
     return False
 
+def check_turnstile_like_dom(sb) -> bool:
+    """弹窗里是否存在 Turnstile 风格的容器（用于 kind=none 时的兜底）。"""
+    try:
+        return bool(sb.execute_script('''
+            return (function() {
+                if (document.querySelector("#turnstile-container-renew")) return true;
+                if (document.querySelector("input[name='cf-turnstile-response']")) return true;
+                if (document.querySelector("[id*='cf-chl-widget']")) return true;
+                var txt = document.body ? document.body.innerText : "";
+                if (txt.indexOf("Renew Server") > -1 &&
+                    txt.indexOf("security verification") > -1) return true;
+                return false;
+            })()
+        '''))
+    except Exception:
+        return False
+
 def check_renew_modal_open(sb) -> bool:
     try:
         return bool(sb.execute_script('''
@@ -958,9 +1058,20 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
     print(f"  [INFO] 续期弹窗: {'已打开' if modal_open else '未检测到'}")
 
     # ==========================================================
+    # 判定验证组件类型（RE 盾 / CF 盾），并留证
+    # ==========================================================
+    kind = detect_captcha_kind(sb)
+    print(f"  [INFO] 验证组件类型: {kind}")
+    if kind == "none":
+        # 组件可能还没渲染出来，等一会再判一次
+        time.sleep(4)
+        kind = detect_captcha_kind(sb)
+        print(f"  [INFO] 二次判定: {kind}")
+
+    # ==========================================================
     # 分支 1：reCAPTCHA（CF 盾已换成 RE 盾）
     # ==========================================================
-    if is_recaptcha_present(sb):
+    if kind == "recaptcha" or is_recaptcha_present(sb):
         ok = solve_recaptcha_audio(sb, idx, max_attempts=3)
         safe_screenshot(sb, shot(idx, f"server_{sid_f}_recaptcha"))
         if ok:
@@ -968,12 +1079,22 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
         if not check_renew_modal_open(sb):
             print("  [INFO] 弹窗已关闭，续期已提交")
             return True
-        print("  [WARN] reCAPTCHA 语音通道未通过")
-        return False
+
+        # reCAPTCHA 通道失败后，若页面同时具备 Turnstile 特征则回退
+        if check_turnstile_like_dom(sb):
+            print("  [INFO] reCAPTCHA 未通过，检测到 Turnstile 特征，回退点击通道")
+        else:
+            print("  [WARN] reCAPTCHA 语音通道未通过，且无 Turnstile 兜底")
+            return False
 
     # ==========================================================
     # 分支 2：Cloudflare Turnstile
     # ==========================================================
+    if kind == "none" and not check_turnstile_like_dom(sb):
+        print("  [WARN] 未识别到任何验证组件，跳过点击避免空转")
+        return False
+
+    print("  [INFO] 使用 Turnstile 点击通道")
     if check_turnstile_done(sb):
         print("  [INFO] Turnstile 已完成")
         return True
