@@ -1569,13 +1569,25 @@ def login(sb, user: str, pwd: str, idx: int) -> Tuple[bool, Optional[str]]:
     print("  [INFO] 验证出口 IP...")
 
     try:
+        proxy_env = os.environ.get("PROXY_SOCKS5", "")
+        _px = {"http": proxy_env, "https": proxy_env} if proxy_env else None
         ip_info = requests.get(
             "https://api.ipify.org?format=json",
+            proxies=_px,
             timeout=10
         ).json()
-        print(f"  [INFO] 出口IP确认: {ip_info}")
+        print(f"  [INFO] requests 出口IP: {ip_info}")
     except Exception:
         pass
+
+    # 浏览器级出口验证: UC Chrome 是否真走了代理,以此为准
+    try:
+        sb.open("https://api.ipify.org?format=json")
+        time.sleep(2)
+        browser_ip = sb.get_text("body").strip()[:200]
+        print(f"  [INFO] 浏览器出口IP: {browser_ip}")
+    except Exception as e:
+        print(f"  [WARN] 浏览器出口IP获取失败: {e}")
 
     print(f"\n{'─' * 40}")
     print("  [INFO] 访问登录页...")
