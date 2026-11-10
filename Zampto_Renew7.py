@@ -725,12 +725,15 @@ def transcribe_recaptcha_audio(mp3_path: Path) -> str:
 
     words = [w.strip(".,!?") for w in raw.lower().split() if w.strip()]
     digits = "".join(_NUM_WORDS.get(w, "") for w in words)
-    if not digits:
-        # 兜底：识别结果里的裸数字
-        digits = "".join(ch for ch in raw if ch.isdigit())
+    if digits:
+        # 老式纯数字挑战
+        answer = digits
+    else:
+        # 新式英文短句挑战:回填整个识别文本(Host2Play 同款)
+        answer = " ".join(words)
 
-    print(f"  [INFO] 识别原文: {raw!r} → 数字: {digits or '<空>'}")
-    return digits
+    print(f"  [INFO] 识别原文: {raw!r} → 答案: {answer or '<空>'!r}")
+    return answer
 
 def fill_recaptcha_answer(sb, answer: str) -> bool:
     """在 bframe 里填答案并点验证（click + clear + 填入，Host2Play 同款）。"""
@@ -840,8 +843,10 @@ def click_recaptcha_anchor(sb) -> bool:
 
 def solve_recaptcha_audio(sb, idx: int, max_attempts: int = 3) -> bool:
     """
-    reCAPTCHA 语音挑战全流程：
-    bframe → 切语音 → 下载 mp3 → Vosk 离线识别 → 回填验证。
+    reCAPTCHA 语音挑战全流程（DrissionPage 版）：
+    attach 到 UC 同一浏览器 → get_frames 直取 anchor/bframe（不经
+    switch_to,UC 下 chromedriver 对跨域 OOPIF 切换会崩）→ 切语音 →
+    下载 mp3 → Vosk 离线识别 → 回填验证。移植自 Host2Play。
     """
     print("  [INFO] 检测到 reCAPTCHA，走语音识别通道")
 
@@ -849,97 +854,294 @@ def solve_recaptcha_audio(sb, idx: int, max_attempts: int = 3) -> bool:
         print("  [INFO] reCAPTCHA token 已存在，无需处理")
         return True
 
-    # 1. 唤起挑战面板
-    frames = get_recaptcha_frames(sb)
-    if not frames.get("bframe"):
-        click_recaptcha_anchor(sb)
-        time.sleep(3)
+    try:
+        from DrissionPage import ChromiumPage
+        from DrissionPage.errors import PageDisconnectedError
+    except ImportError:
+        print("  [WARN] DrissionPage 未安装，reCAPTCHA 通道不可用")
+        return False
 
-    # 面板可能已打开但没有题目内容，先确认 bframe 内有挑战元素
-    if not is_recaptcha_challenge_ready(sb):
-        click_recaptcha_anchor(sb)
-        time.sleep(3)
+    # attach 到 UC 同一个浏览器
+    try:
+        dbg = (sb.driver.capabilities.get("goog:chromeOptions") or {}).get(
+            "debuggerAddress")
+        page = ChromiumPage(addr_or_opts=dbg) if dbg else ChromiumPage()
+    except Exception as e:
+        print(f"  [WARN] DrissionPage attach 失败: {e}")
+        return False
 
-    for attempt in range(1, max_attempts + 1):
-        print(f"  [INFO] reCAPTCHA 语音尝试 {attempt}/{max_attempts}")
+    import html as _html
+    import requests as _requests
 
-        if is_recaptcha_blocked(sb):
-            print("  [ERROR] bframe 显示封禁提示（Try again later）")
-            return False
-
-        origin_handle = switch_to_recaptcha_bframe(sb)
-        if not origin_handle:
-            return False
-
+    def find_frame(kind):
         try:
-            if not is_audio_mode(sb):
-                click_recaptcha_audio_button(sb)
-                time.sleep(random.uniform(2, 4))
-                if not is_audio_mode(sb):
-                    print("  [WARN] 未进入语音模式，重试点击")
-                    click_recaptcha_audio_button(sb)
-                    time.sleep(2)
+            for f in page.get_frames():
+                u = f.url or ""
+                if "recaptcha" in u and kind in u:
+                    return f
+        except Exception:
+            pass
+        return None
 
-            audio_url = get_recaptcha_audio_url(sb, timeout=25)
-            if audio_url == "__BLOCKED__":
-                exit_recaptcha_bframe(sb, origin_handle)
-                print("  [ERROR] 出口 IP 被 Google 判定为自动化，语音通道不可用")
-                return False
-            if not audio_url:
-                print("  [WARN] 未取到音频链接")
-                exit_recaptcha_bframe(sb, origin_handle)
-                time.sleep(2)
-                continue
-
-            print(f"  [INFO] 音频链接 {(audio_url[:60])}...")
-            path = download_recaptcha_audio(sb, audio_url)
-            exit_recaptcha_bframe(sb, origin_handle)
-            if not path:
-                continue
-
-            answer = transcribe_recaptcha_audio(path)
-            if not answer:
-                print("  [WARN] 识别为空，重新取音频")
-                continue
-
-            # 重新进入 bframe 回填
-            origin_handle = switch_to_recaptcha_bframe(sb)
-            if not origin_handle:
-                return False
-            ok = fill_recaptcha_answer(sb, answer)
-            exit_recaptcha_bframe(sb, origin_handle)
-            if not ok:
-                print("  [WARN] 回填答案失败")
-                continue
-
-            print(f"  [INFO] 已提交答案 {answer}")
-            time.sleep(4)
-
-            if verify_recaptcha_token(sb):
-                print("  [INFO] reCAPTCHA 验证通过")
-                return True
-
-            # 未通过时点一下刷新换题
-            origin_handle = switch_to_recaptcha_bframe(sb)
-            if origin_handle:
+    def is_solved():
+        try:
+            for f in page.get_frames():
                 try:
-                    sb.execute_script('''
-                        (function() {
-                            var b = document.getElementById("recaptcha-reload-button");
-                            if (b) b.click();
-                        })()
-                    ''')
+                    token = f.run_js(
+                        'return document.querySelector('
+                        '"textarea[name=\'g-recaptcha-response\']")?.value')
+                    if token and len(str(token)) > 30:
+                        return True
                 except Exception:
                     pass
-                exit_recaptcha_bframe(sb, origin_handle)
-            time.sleep(3)
+        except Exception:
+            pass
+        a = find_frame("anchor")
+        if a:
+            try:
+                checked = a.run_js(
+                    'return document.querySelector(\'#recaptcha-anchor\')'
+                    '?.getAttribute(\'aria-checked\') === \'true\'')
+                if checked:
+                    return True
+            except Exception:
+                pass
+        return False
 
+    def blocked():
+        b = find_frame("bframe")
+        if not b:
+            return False
+        try:
+            return bool(b.run_js('''
+                const h = document.querySelector(
+                    '.rc-doscaptcha-header-text');
+                if (h && h.textContent.toLowerCase().includes(
+                        'try again later')) return true;
+                const e = document.querySelector(
+                    '.rc-audiochallenge-error-message');
+                if (e && e.offsetParent !== null) return true;
+                return false;
+            '''))
+        except Exception:
+            return False
+
+    def click_checkbox():
+        a = find_frame("anchor")
+        if not a:
+            return False
+        box = a.ele("#recaptcha-anchor", timeout=3)
+        if not box:
+            return False
+        try:
+            page.actions.move_to(
+                box, duration=random.uniform(0.4, 1.0))
+            time.sleep(random.uniform(0.2, 0.5))
+            box.click()
+        except Exception:
+            try:
+                box.click(by_js=True)
+            except Exception:
+                return False
+        time.sleep(3)
+        return True
+
+    def switch_audio():
+        b = find_frame("bframe")
+        if not b:
+            return False
+        if b.ele("#audio-response", timeout=1):
+            return True
+        btn = b.ele("#recaptcha-audio-button", timeout=3)
+        if not btn:
+            return False
+        try:
+            btn.click()
+        except Exception:
+            btn.click(by_js=True)
+        time.sleep(random.uniform(1.5, 2.5))
+        return bool(b.ele("#audio-response", timeout=2))
+
+    def audio_url():
+        b = find_frame("bframe")
+        if not b:
+            return None
+        for _ in range(10):
+            for sel in (".rc-audiochallenge-tdownload-link",
+                        ".rc-audiochallenge-ndownload-link"):
+                try:
+                    link = b.ele(sel, timeout=1)
+                    if link:
+                        href = link.attr("href")
+                        if href and len(href) > 10:
+                            return _html.unescape(href)
+                except Exception:
+                    pass
+            try:
+                au = b.ele("#audio-source", timeout=1)
+                if au:
+                    src = au.attr("src")
+                    if src and len(src) > 10:
+                        return _html.unescape(src)
+            except Exception:
+                pass
+            time.sleep(1)
+        return None
+
+    def reload():
+        b = find_frame("bframe")
+        if not b:
+            return
+        try:
+            r = b.ele("#recaptcha-reload-button", timeout=2)
+            if r:
+                try:
+                    r.click()
+                except Exception:
+                    r.click(by_js=True)
+                time.sleep(3)
+        except Exception:
+            pass
+
+    def fill_verify(text):
+        b = find_frame("bframe")
+        if not b:
+            return False
+        try:
+            inp = b.ele("#audio-response", timeout=2)
+            if not inp:
+                return False
+            inp.click()
+            inp.clear()
+            inp.input(text)
+        except Exception:
+            return False
+        time.sleep(random.uniform(0.5, 1.5))
+        try:
+            v = b.ele("#recaptcha-verify-button", timeout=2)
+            if v:
+                try:
+                    v.click()
+                except Exception:
+                    v.click(by_js=True)
+        except Exception:
+            pass
+        return True
+
+    def download(url):
+        headers = {
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36"),
+            "Referer": "https://www.google.com/",
+        }
+        urls = [url]
+        if "recaptcha.net" in url:
+            urls.append(url.replace("recaptcha.net", "www.google.com"))
+        elif "google.com" in url:
+            urls.append(url.replace("www.google.com", "recaptcha.net"))
+        for u in urls:
+            try:
+                r = _requests.get(u, headers=headers, timeout=30,
+                                  proxies=_proxies())
+                r.raise_for_status()
+                if len(r.content) < 1000:
+                    continue
+                p = AUDIO_DIR / f"rc_{int(time.time()*1000)}.mp3"
+                AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(r.content)
+                return p
+            except Exception:
+                pass
+        return None
+
+    def _proxies():
+        px = os.environ.get("PROXY_SOCKS5", "")
+        if not px:
+            return None
+        # 本地 DNS + 该代理上游 = SSL EOF,必须 socks5h 让 DNS 走代理
+        px = px.replace("socks5://", "socks5h://")
+        return {"http": px, "https": px}
+
+    # 等 anchor 出现
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if find_frame("anchor"):
+            break
+        time.sleep(1)
+
+    dl_fails = 0
+    for i in range(max_attempts * 3):
+        try:
+            if is_solved():
+                print("  [INFO] reCAPTCHA 已通过 (DP)")
+                return True
+            if blocked():
+                print("  [ERROR] bframe 显示封禁提示 (Try again later)")
+                return False
+
+            if i == 0:
+                click_checkbox()
+                time.sleep(2)
+                if is_solved():
+                    print("  [INFO] reCAPTCHA 复选框直接通过")
+                    return True
+
+            if not switch_audio():
+                time.sleep(3)
+                if not switch_audio():
+                    click_checkbox()
+                    time.sleep(3)
+                    continue
+            time.sleep(random.uniform(2, 4))
+
+            if blocked():
+                print("  [ERROR] 音频模式检测到 IP 被封锁")
+                return False
+
+            url = audio_url()
+            if not url:
+                reload()
+                continue
+
+            print(f"  [INFO] 音频链接 {url[:60]}...")
+            mp3 = download(url)
+            if not mp3:
+                dl_fails += 1
+                if dl_fails >= 3:
+                    print("  [ERROR] 音频连续下载失败")
+                    return False
+                reload()
+                time.sleep(random.uniform(3, 6))
+                continue
+            dl_fails = 0
+
+            text = transcribe_recaptcha_audio(mp3)
+            try:
+                mp3.unlink()
+            except Exception:
+                pass
+            if not text:
+                print("  [WARN] 识别为空，重新取音频")
+                reload()
+                time.sleep(3)
+                continue
+
+            print(f"  [INFO] 识别结果: [{text}]")
+            fill_verify(text)
+            time.sleep(5)
+            if is_solved():
+                print("  [INFO] reCAPTCHA 已通过（语音通道）")
+                return True
+            reload()
+            time.sleep(random.uniform(2, 4))
+        except PageDisconnectedError:
+            print("  [WARN] DP 与浏览器断开")
+            return False
         except Exception as e:
-            exit_recaptcha_bframe(sb, origin_handle)
-            print(f"  [WARN] 语音流程异常: {e}")
+            print(f"  [WARN] DP reCAPTCHA 轮异常: {e}")
             time.sleep(2)
 
-    print("  [WARN] reCAPTCHA 语音验证未通过")
+    print("  [WARN] reCAPTCHA 语音通道未通过")
     return False
 
 def check_turnstile_like_dom(sb) -> bool:
