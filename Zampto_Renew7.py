@@ -1257,6 +1257,7 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
         print(f"  [WARN] 清理残留 Turnstile 失败: {e}")
 
     print("  [INFO] 处理 Turnstile 验证...")
+    cdp_clicked = False
     for attempt in range(3):
         print(f"  [INFO] 坐标计算完成 (第{attempt+1}次)")
         clicked = uc_click_with_timeout(sb, timeout=20)
@@ -1270,6 +1271,35 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
         if not check_renew_modal_open(sb):
             print(f"  [INFO] 弹窗已关闭，续期已提交")
             return True
+
+        # uc_gui 坐标未命中时,用 CDP 直接对 iframe 中心派发可信点击
+        if not cdp_clicked:
+            try:
+                box = sb.execute_script('''
+                    (function() {
+                        var f = document.querySelector(
+                            "iframe[src*='challenges.cloudflare.com']");
+                        if (!f) return null;
+                        var r = f.getBoundingClientRect();
+                        return {x: r.x + r.width / 2, y: r.y + r.height / 2,
+                                w: r.width, h: r.height};
+                    })()
+                ''')
+                if box and box.get("w", 0) > 10:
+                    x, y = box["x"], box["y"]
+                    print(f"  [INFO] Turnstile iframe 中心: ({x:.0f},{y:.0f}) {box['w']:.0f}x{box['h']:.0f}")
+                    for t_ in ("mousePressed", "mouseReleased"):
+                        sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                            "type": t_, "x": x, "y": y,
+                            "button": "left", "clickCount": 1})
+                    cdp_clicked = True
+                    time.sleep(3)
+                    safe_screenshot(sb, shot(idx, f"ts_cdp_{attempt+1}"))
+                    if check_turnstile_done(sb):
+                        print(f"  [INFO] Turnstile 通过 (CDP 点击,第{attempt+1}次)")
+                        return True
+            except Exception as e:
+                print(f"  [WARN] CDP 点击失败: {e}")
 
         if not clicked:
             time.sleep(5)
