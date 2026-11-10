@@ -1238,7 +1238,10 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
                           "[id*='cf-chl-widget'], .cf-turnstile, " +
                           "iframe[src*='challenges.cloudflare.com']";
                 document.querySelectorAll(sel).forEach(function(el) {
-                    if (el.closest("#turnstile-container-renew")) return;
+                    var r = el.getBoundingClientRect();
+                    var visible = r.width > 10 && r.height > 10 &&
+                                  r.bottom > 0 && r.top < window.innerHeight;
+                    if (visible) return;
                     var box = el.closest("div") || el;
                     box.remove();
                     n++;
@@ -1256,6 +1259,7 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
         print(f"  [INFO] 坐标计算完成 (第{attempt+1}次)")
         clicked = uc_click_with_timeout(sb, timeout=20)
         time.sleep(3)
+        safe_screenshot(sb, shot(idx, f"ts_attempt_{attempt+1}"))
 
         if check_turnstile_done(sb):
             print(f"  [INFO] Turnstile 通过 (第{attempt+1}次)")
