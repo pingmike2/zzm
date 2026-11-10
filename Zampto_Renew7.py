@@ -1148,6 +1148,26 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
         time.sleep(4)
         kind = detect_captcha_kind(sb)
         print(f"  [INFO] 二次判定: {kind}")
+    if kind == "none":
+        # 打印弹窗内全部 iframe，留证排查
+        try:
+            iframes_info = sb.execute_script('''
+                return (function() {
+                    var o = [];
+                    document.querySelectorAll("iframe").forEach(function(f) {
+                        o.push({src: (f.src || "").slice(0, 120),
+                                title: f.title || "", id: f.id || "",
+                                w: f.offsetWidth, h: f.offsetHeight});
+                    });
+                    return o;
+                })()
+            ''') or []
+            for f in iframes_info:
+                print(f"  [DEBUG] iframe: src={f.get('src','')} title={f.get('title','')} {f.get('w')}x{f.get('h')}")
+            txt = sb.execute_script("return (document.body ? document.body.innerText : '').slice(0, 400)") or ""
+            print(f"  [DEBUG] 页面文本: {txt!r}")
+        except Exception:
+            pass
 
     # ==========================================================
     # 分支 1：reCAPTCHA（CF 盾已换成 RE 盾）
