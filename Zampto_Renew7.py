@@ -1345,7 +1345,17 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
                                 best = (area, b)
                         if best and best[0] > 100:
                             b = best[1]
-                            box = {"x": b[0] + b[2] / 2, "y": b[1] + b[3] / 2,
+                            try:
+                                sc = sb.execute_script('''
+                                    (function() {
+                                        return {x: window.scrollX || 0,
+                                                y: window.scrollY || 0};
+                                    })()
+                                ''') or {}
+                            except Exception:
+                                sc = {}
+                            box = {"x": b[0] + b[2] / 2 - sc.get("x", 0),
+                                   "y": b[1] + b[3] / 2 - sc.get("y", 0),
                                    "w": b[2], "h": b[3], "tag": "snapshot"}
                     except Exception as e:
                         print(f"  [WARN] DOMSnapshot 失败: {e}")
