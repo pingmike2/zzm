@@ -1140,16 +1140,43 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
 
     # ==========================================================
     # 判定验证组件类型（RE 盾 / CF 盾），并留证
+    # page_source 检测最可靠：JS 扫不到 shadow DOM 里的 iframe
     # ==========================================================
-    kind = detect_captcha_kind(sb)
+    try:
+        src = sb.get_page_source() or ""
+    except Exception:
+        src = ""
+    if "challenges.cloudflare.com" in src or "cf-turnstile" in src:
+        kind = "turnstile"
+    elif "recaptcha" in src or "g-recaptcha" in src:
+        kind = "recaptcha"
+    else:
+        kind = detect_captcha_kind(sb)
     print(f"  [INFO] 验证组件类型: {kind}")
+
     if kind == "none":
         # 组件可能还没渲染出来，等一会再判一次
         time.sleep(4)
-        kind = detect_captcha_kind(sb)
+        try:
+            src = sb.get_page_source() or ""
+        except Exception:
+            src = ""
+        if "challenges.cloudflare.com" in src or "cf-turnstile" in src:
+            kind = "turnstile"
+        elif "recaptcha" in src or "g-recaptcha" in src:
+            kind = "recaptcha"
+        else:
+            kind = detect_captcha_kind(sb)
         print(f"  [INFO] 二次判定: {kind}")
+
     if kind == "none":
-        # 打印弹窗内全部 iframe，留证排查
+        # 落盘弹窗 HTML 与 iframe 列表，随 artifact 上传排查
+        try:
+            dump_path = OUTPUT_DIR / f"modal_dump_{sid_f}.html"
+            dump_path.write_text(sb.get_page_source(), encoding="utf-8")
+            print(f"  [DEBUG] 弹窗 HTML 已落盘 {dump_path.name}")
+        except Exception as e:
+            print(f"  [DEBUG] 弹窗 HTML 落盘失败: {e}")
         try:
             iframes_info = sb.execute_script('''
                 return (function() {
@@ -1164,10 +1191,8 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
             ''') or []
             for f in iframes_info:
                 print(f"  [DEBUG] iframe: src={f.get('src','')} title={f.get('title','')} {f.get('w')}x{f.get('h')}")
-            txt = sb.execute_script("return (document.body ? document.body.innerText : '').slice(0, 400)") or ""
-            print(f"  [DEBUG] 页面文本: {txt!r}")
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"  [DEBUG] iframe 扫描失败: {e}")
 
     # ==========================================================
     # 分支 1：reCAPTCHA（CF 盾已换成 RE 盾）
@@ -1190,9 +1215,11 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
 
     # ==========================================================
     # 分支 2：Cloudflare Turnstile
+    # kind=none 也走点击通道：截图证实弹窗内是 Turnstile
+    # （可能挂在 shadow DOM，选择器扫不到但 uc 坐标点击有效）
     # ==========================================================
-    if kind == "none" and not check_turnstile_like_dom(sb):
-        print("  [WARN] 未识别到任何验证组件，跳过点击避免空转")
+    if kind == "none" and not modal_open:
+        print("  [WARN] 未识别到验证组件且弹窗未打开，跳过")
         return False
 
     print("  [INFO] 使用 Turnstile 点击通道")
