@@ -1228,6 +1228,25 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
         print("  [INFO] Turnstile 已完成")
         return True
 
+    # 等 widget 真正渲染完成(Loading Cloudflare verification 转成 checkbox)
+    # 最多 30s,每 3s 查一次快照里是否出现 turnstile iframe
+    widget_ready = False
+    for _ in range(10):
+        try:
+            snap = sb.driver.execute_cdp_cmd(
+                "DOMSnapshot.captureSnapshot", {"computedStyles": []})
+            strs = snap["strings"]
+            joined = " ".join(strs)
+            if "challenges.cloudflare.com" in joined:
+                widget_ready = True
+                print("  [INFO] Turnstile widget 已渲染")
+                break
+        except Exception:
+            pass
+        time.sleep(3)
+    if not widget_ready:
+        print("  [WARN] 30s 内 Turnstile widget 未渲染完成")
+
     # 清掉弹窗外的残留 Turnstile（登录页遗留 iframe 会让
     # uc_gui_click_captcha 点到隐藏 widget 上，坐标全空转）
     try:
@@ -1350,6 +1369,28 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
                         return True
                 else:
                     print("  [DEBUG] 未定位到 turnstile iframe (CDP+shadow 均未命中)")
+                    try:
+                        snap2 = sb.driver.execute_cdp_cmd(
+                            "DOMSnapshot.captureSnapshot", {"computedStyles": []})
+                        s2 = snap2["strings"]; d2 = snap2["documents"][0]
+                        n2 = d2["nodes"]
+                        nms = [s2[i] if isinstance(i, int) and i < len(s2) else ""
+                               for i in n2["nodeName"]]
+                        icount = 0
+                        for ni in range(len(nms)):
+                            if nms[ni] == "IFRAME":
+                                icount += 1
+                                vals = [s2[j] for j in n2["attributes"][ni]
+                                        if isinstance(j, int) and j < len(s2)]
+                                src = ""
+                                for k in range(0, len(vals) - 1):
+                                    if vals[k] == "src":
+                                        src = vals[k + 1][:100]
+                                        break
+                                print(f"  [DEBUG] 快照 iframe#{icount}: src={src!r}")
+                        print(f"  [DEBUG] 快照 iframe 总数: {icount}")
+                    except Exception as e:
+                        print(f"  [DEBUG] 快照诊断失败: {e}")
             except Exception as e:
                 print(f"  [WARN] CDP 点击失败: {e}")
 
