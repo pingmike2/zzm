@@ -1311,7 +1311,7 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
                         var el = els[i];
                         var host = (el.closest && el.closest("[data-sitekey]")) || el;
                         var r = host.getBoundingClientRect();
-                        if (r.top + r.height > vh - 10 && r.top > vh / 2) {
+                        if (r.top > vh * 0.8 && r.top + r.height > vh - 120) {
                             host.remove();
                             n++;
                         }
@@ -1330,7 +1330,48 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
         if not cdp_clicked:
             try:
                 box = None
-                # 首选: 轻 DOM 容器 rect(视口坐标,最准);收集全部候选并打印
+                # 首选: CDP DOM.getDocument(pierce:true) 穿透 closed shadow root
+                try:
+                    root = sb.driver.execute_cdp_cmd("DOM.getDocument",
+                                                     {"depth": -1, "pierce": True})
+                    hits = []
+
+                    def walk(node):
+                        nn = node.get("nodeName", "")
+                        if nn == "IFRAME":
+                            attrs = node.get("attributes", [])
+                            for k in range(0, len(attrs) - 1):
+                                if attrs[k] in ("src", "title") and (
+                                        "challenges.cloudflare.com" in attrs[k + 1]
+                                        or "Widget containing" in attrs[k + 1]):
+                                    hits.append(node.get("backendNodeId"))
+                                    break
+                        for ch in node.get("children", []) or []:
+                            walk(ch)
+                        for sc in node.get("shadowRoots", []) or []:
+                            walk(sc)
+
+                    walk(root["root"])
+                    print(f"  [DEBUG] DOM pierce 命中 CF iframe: {len(hits)}")
+                    for bid in hits:
+                        try:
+                            bm = sb.driver.execute_cdp_cmd(
+                                "DOM.getBoxModel", {"backendNodeId": bid})
+                            q = bm["model"]["content"]
+                            xs, ys = q[0::2], q[1::2]
+                            x0, x1 = min(xs), max(xs)
+                            y0, y1 = min(ys), max(ys)
+                            w, h = x1 - x0, y1 - y0
+                            print(f"  [DEBUG] pierce iframe box=({x0:.0f},{y0:.0f}) {w:.0f}x{h:.0f}")
+                            if w > 50 and h > 20:
+                                box = {"x": x0 + 30, "y": y0 + h / 2,
+                                       "w": w, "h": h, "tag": "pierce"}
+                                break
+                        except Exception:
+                            continue
+                except Exception as e:
+                    print(f"  [WARN] DOM pierce 失败: {e}")
+                # 次选: 轻 DOM 容器 rect(视口坐标);收集全部候选并打印
                 try:
                     cands = sb.execute_script('''
                         (function() {
