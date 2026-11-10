@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, sys, time, platform, requests, re, signal
+import os, sys, time, platform, requests, re, signal, random
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
@@ -510,23 +510,43 @@ def click_recaptcha_audio_button(sb, wait: int = 15) -> bool:
     return False
 
 def get_recaptcha_audio_url(sb, timeout: int = 30) -> Optional[str]:
-    """从 bframe 的 audio source 取 mp3 直链（可能是 blob:）。"""
+    """
+    从 bframe 取音频直链。优先下载链接（tdownload/ndownload），再退 audio 元素。
+    Host2Play 同款选择器：音频经常只在下载链接里，audio 元素可能没有 src。
+    """
     deadline = time.time() + timeout
+    import html as _html
+
     while time.time() < deadline:
         try:
             info = sb.execute_script('''
                 return (function() {
                     var body = document.body ? document.body.innerText : "";
-                    var blocked = body.indexOf("Try again later") > -1 ||
-                                  body.indexOf("automated queries") > -1;
-                    var a = document.querySelector("audio#audio-source, audio source, audio");
-                    if (!a) return { url: "", blocked: blocked };
-                    var src = a.getAttribute("src") || a.src || "";
-                    if (!src) {
-                        var s = a.querySelector("source");
-                        src = s ? (s.getAttribute("src") || s.src || "") : "";
+                    var blocked =
+                        !!document.querySelector(".rc-doscaptcha-header-text") ||
+                        body.indexOf("Try again later") > -1 ||
+                        body.indexOf("automated queries") > -1;
+
+                    // 1. 下载链接（最可靠）
+                    var link = document.querySelector(".rc-audiochallenge-tdownload-link")
+                            || document.querySelector(".rc-audiochallenge-ndownload-link");
+                    if (link) {
+                        var href = link.getAttribute("href") || "";
+                        if (href.length > 10) return { url: href, blocked: false };
                     }
-                    return { url: src || "", blocked: blocked };
+
+                    // 2. audio 元素
+                    var a = document.querySelector("audio#audio-source, audio source, audio");
+                    if (a) {
+                        var src = a.getAttribute("src") || a.src || "";
+                        if (!src) {
+                            var s = a.querySelector("source");
+                            src = s ? (s.getAttribute("src") || s.src || "") : "";
+                        }
+                        if (src.length > 10) return { url: src, blocked: false };
+                    }
+
+                    return { url: "", blocked: blocked };
                 })()
             ''') or {}
 
@@ -535,11 +555,43 @@ def get_recaptcha_audio_url(sb, timeout: int = 30) -> Optional[str]:
                 return "__BLOCKED__"
 
             if info.get("url"):
-                return str(info["url"])
+                return _html.unescape(str(info["url"]))
         except Exception:
             pass
         time.sleep(1)
     return None
+
+def is_recaptcha_blocked(sb) -> bool:
+    """bframe 内是否出现封禁提示（doscaptcha / 音频错误信息）。"""
+    try:
+        return bool(sb.execute_script('''
+            return (function() {
+                var h = document.querySelector(".rc-doscaptcha-header-text");
+                if (h && h.textContent.toLowerCase().indexOf("try again later") > -1) return true;
+                var e = document.querySelector(".rc-audiochallenge-error-message");
+                if (e && e.offsetParent !== null) return true;
+                return false;
+            })()
+        '''))
+    except Exception:
+        return False
+
+def is_audio_mode(sb) -> bool:
+    """bframe 是否已切到语音模式（audio-response 可见）。"""
+    origin_handle = switch_to_recaptcha_bframe(sb)
+    if not origin_handle:
+        return False
+    try:
+        return bool(sb.execute_script('''
+            return (function() {
+                var i = document.getElementById("audio-response");
+                return !!(i && i.offsetParent !== null);
+            })()
+        '''))
+    except Exception:
+        return False
+    finally:
+        exit_recaptcha_bframe(sb, origin_handle)
 
 def download_recaptcha_audio(sb, url: str) -> Optional[Path]:
     """
@@ -578,16 +630,28 @@ def download_recaptcha_audio(sb, url: str) -> Optional[Path]:
             return None
 
     try:
-        r = requests.get(url, timeout=30, headers={
-            "User-Agent": "Mozilla/5.0",
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Referer": "https://www.google.com/",
-        })
-        if r.status_code != 200 or not r.content:
-            print(f"  [WARN] 音频下载失败 HTTP {r.status_code}")
-            return None
-        out.write_bytes(r.content)
-        print(f"  [INFO] 音频已下载 {out.name} ({len(r.content)} bytes)")
-        return out
+        }
+        # recaptcha.net / google.com 双域互换重试（Host2Play 同款兜底）
+        urls = [url]
+        if "recaptcha.net" in url:
+            urls.append(url.replace("recaptcha.net", "www.google.com"))
+        elif "google.com" in url:
+            urls.append(url.replace("www.google.com", "recaptcha.net"))
+
+        for audio_url in urls:
+            try:
+                r = requests.get(audio_url, timeout=30, headers=headers)
+                if r.status_code != 200 or len(r.content) < 1000:
+                    continue
+                out.write_bytes(r.content)
+                print(f"  [INFO] 音频已下载 {out.name} ({len(r.content)} bytes)")
+                return out
+            except Exception as e:
+                print(f"  [WARN] 下载失败 {audio_url[:60]}: {e}")
+        return None
     except Exception as e:
         print(f"  [WARN] 音频下载异常: {e}")
         return None
@@ -663,22 +727,30 @@ def transcribe_recaptcha_audio(mp3_path: Path) -> str:
     return digits
 
 def fill_recaptcha_answer(sb, answer: str) -> bool:
-    """在 bframe 里填答案并点验证。"""
+    """在 bframe 里填答案并点验证（click + clear + 填入，Host2Play 同款）。"""
     js = '''
         var ans = arguments[0];
         var inp = document.getElementById("audio-response");
         if (!inp) return false;
+        inp.focus();
+        inp.value = "";
         inp.value = ans;
         inp.dispatchEvent(new Event("input", {bubbles: true}));
         inp.dispatchEvent(new Event("change", {bubbles: true}));
-        var btn = document.getElementById("recaptcha-verify-button")
-               || document.querySelector("button#recaptcha-verify-button")
-               || document.querySelector("button[id*='verify']");
-        if (btn) { btn.click(); return true; }
-        return false;
+        return true;
+    '''
+    js_verify = '''
+        return (function() {
+            var btn = document.getElementById("recaptcha-verify-button");
+            if (btn) { btn.click(); return true; }
+            return false;
+        })()
     '''
     try:
-        return bool(sb.execute_script(js, answer))
+        if not sb.execute_script(js, answer):
+            return False
+        time.sleep(random.uniform(0.5, 1.5))
+        return bool(sb.execute_script(js_verify))
     except Exception as e:
         print(f"  [WARN] 填写答案异常: {e}")
         return False
@@ -785,13 +857,22 @@ def solve_recaptcha_audio(sb, idx: int, max_attempts: int = 3) -> bool:
     for attempt in range(1, max_attempts + 1):
         print(f"  [INFO] reCAPTCHA 语音尝试 {attempt}/{max_attempts}")
 
+        if is_recaptcha_blocked(sb):
+            print("  [ERROR] bframe 显示封禁提示（Try again later）")
+            return False
+
         origin_handle = switch_to_recaptcha_bframe(sb)
         if not origin_handle:
             return False
 
         try:
-            click_recaptcha_audio_button(sb)
-            time.sleep(2)
+            if not is_audio_mode(sb):
+                click_recaptcha_audio_button(sb)
+                time.sleep(random.uniform(2, 4))
+                if not is_audio_mode(sb):
+                    print("  [WARN] 未进入语音模式，重试点击")
+                    click_recaptcha_audio_button(sb)
+                    time.sleep(2)
 
             audio_url = get_recaptcha_audio_url(sb, timeout=25)
             if audio_url == "__BLOCKED__":
