@@ -1310,18 +1310,15 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
                         (function() {
                             var out = [];
                             var els = document.querySelectorAll(
-                                "#turnstile-container-renew, [class*='cf-turnstile'], [id*='cf-chl-widget']"
+                                "#turnstile-container-renew, [class*='cf-turnstile'], [id*='cf-chl-widget'], [data-sitekey]"
                             );
                             for (var i = 0; i < els.length; i++) {
                                 var r = els[i].getBoundingClientRect();
-                                if (r.width > 50 && r.height > 20) {
-                                    out.push({
-                                        x: r.x, y: r.y, w: r.width, h: r.height,
-                                        tag: els[i].id || els[i].className
-                                    });
-                                }
+                                out.push({
+                                    x: r.x, y: r.y, w: r.width, h: r.height,
+                                    tag: (els[i].id || els[i].className || els[i].tagName).slice(0, 40)
+                                });
                             }
-                            out.vh = window.innerHeight;
                             return out;
                         })()
                     ''') or []
@@ -1339,49 +1336,62 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
                         except Exception:
                             vh = None
                     for c in (cands if isinstance(cands, list) else []):
-                        # 排除贴视口底边的登录残留
+                        # 排除贴视口底边的登录残留 + 0 尺寸隐藏节点
                         if vh and c["y"] + c["h"] > vh - 10:
+                            continue
+                        if c["w"] <= 50 or c["h"] <= 20:
                             continue
                         box = {"x": c["x"] + 30, "y": c["y"] + c["h"] / 2,
                                "w": c["w"], "h": c["h"], "tag": "container"}
                         break
                 if box is None or box.get("w", 0) <= 10:
-                    # 次选: DOMSnapshot 快照里挑面积最大的 turnstile iframe
+                    # 次选: DOMSnapshot 快照扫全部 document,按 src 或 title 匹配
                     try:
                         snap = sb.driver.execute_cdp_cmd(
                             "DOMSnapshot.captureSnapshot", {"computedStyles": []})
                         strs = snap["strings"]
-                        doc = snap["documents"][0]
-                        nodes = doc["nodes"]
-                        layout = doc["layout"]
-                        nnames = [strs[i] if isinstance(i, int) and i < len(strs) else ""
-                                  for i in nodes["nodeName"]]
+                        try:
+                            vh_ = sb.execute_script('''
+                                (function() { return window.innerHeight; })()
+                            ''')
+                        except Exception:
+                            vh_ = None
                         best = None
-                        for ni in range(len(nnames)):
-                            if nnames[ni] != "IFRAME":
-                                continue
-                            vals = [strs[j] for j in nodes["attributes"][ni]
-                                    if isinstance(j, int) and j < len(strs)]
-                            is_cf = any(vals[k] == "src" and
-                                        "challenges.cloudflare.com" in vals[k + 1]
-                                        for k in range(0, len(vals) - 1))
-                            if not is_cf or ni not in layout["nodeIndex"]:
-                                continue
-                            b = layout["bounds"][layout["nodeIndex"].index(ni)]
-                            area = b[2] * b[3]
-                            # 排除贴视口底边的登录残留 iframe
-                            try:
-                                vh_ = sb.execute_script('''
-                                    (function() { return window.innerHeight; })()
-                                ''')
-                            except Exception:
-                                vh_ = None
-                            if vh_ and b[1] + b[3] > vh_ - 10:
-                                continue
-                            if best is None or area > best[0]:
-                                best = (area, b)
-                        if best and best[0] > 100:
-                            b = best[1]
+                        ndocs = len(snap.get("documents", []))
+                        print(f"  [DEBUG] 快照 document 数: {ndocs}")
+                        for di in range(ndocs):
+                            doc = snap["documents"][di]
+                            nodes = doc["nodes"]
+                            layout = doc["layout"]
+                            nnames = [strs[i] if isinstance(i, int) and i < len(strs)
+                                      else "" for i in nodes["nodeName"]]
+                            for ni in range(len(nnames)):
+                                if nnames[ni] != "IFRAME":
+                                    continue
+                                vals = [strs[j] for j in nodes["attributes"][ni]
+                                        if isinstance(j, int) and j < len(strs)]
+                                is_cf = 0
+                                for k in range(0, len(vals) - 1):
+                                    if vals[k] == "src" and "challenges.cloudflare.com" in vals[k + 1]:
+                                        is_cf = max(is_cf, 2)
+                                    if vals[k] == "title" and "Widget containing" in vals[k + 1]:
+                                        is_cf = max(is_cf, 2)
+                                    if vals[k] == "src" and vals[k + 1] == "about:blank":
+                                        is_cf = max(is_cf, 1)
+                                if is_cf == 0 or ni not in layout["nodeIndex"]:
+                                    continue
+                                b = layout["bounds"][layout["nodeIndex"].index(ni)]
+                                # 排除贴视口底边的登录残留 iframe
+                                if vh_ and b[1] + b[3] > vh_ - 10:
+                                    continue
+                                area = b[2] * b[3]
+                                if area > 100:
+                                    score = is_cf * 1000000 + area
+                                    if best is None or score > best[0]:
+                                        best = (score, b, di, is_cf)
+                        if best:
+                            b, di = best[1], best[2]
+                            print(f"  [DEBUG] 快照候选 doc#{di} bounds={b}")
                             try:
                                 sc = sb.execute_script('''
                                     (function() {
