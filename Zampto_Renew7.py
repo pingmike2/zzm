@@ -301,6 +301,477 @@ def bypass_cloudflare_interstitial(sb, idx: int, max_attempts: int = 6) -> bool:
     print("  [ERROR] Cloudflare 整页挑战绕过失败")
     return False
 
+RECAPTCHA_AUDIOES_URL = "https://www.google.com/recaptcha/api2/userverify"
+RECAPTCHA_ANCHOR_RE = r"iframe\[src\*='recaptcha/api2/anchor'\]"
+RECAPTCHA_BFRAME_RE = r"iframe\[src\*='recaptcha/api2/bframe'\]"
+
+VOSK_MODEL_URL = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
+VOSK_MODEL_DIR = Path("/tmp/vosk-model-small-en-us-0.15")
+VOSK_MODEL_ZIP = Path("/tmp/vosk-model-small-en-us-0.15.zip")
+AUDIO_DIR = Path("/tmp/recaptcha_audio")
+
+_NUM_WORDS = {
+    "zero": "0", "oh": "0", "one": "1", "two": "2", "to": "2", "too": "2",
+    "three": "3", "tree": "3", "four": "4", "for": "4", "five": "5",
+    "six": "6", "seven": "7", "eight": "8", "ate": "8", "nine": "9",
+    "ten": "0",
+}
+
+def is_recaptcha_present(sb) -> bool:
+    """检测弹窗内是否为 reCAPTCHA（而不是 Cloudflare Turnstile）。"""
+    try:
+        return bool(sb.execute_script('''
+            return (function() {
+                if (document.querySelector("iframe[src*='recaptcha']")) return true;
+                if (document.querySelector(".g-recaptcha, #g-recaptcha")) return true;
+                if (document.querySelector("textarea[name='g-recaptcha-response']")) return true;
+                if (document.querySelector("textarea[id^='g-recaptcha-response']")) return true;
+                return false;
+            })()
+        '''))
+    except:
+        return False
+
+def get_recaptcha_frames(sb) -> Dict[str, str]:
+    """返回 anchor / bframe 两个 iframe 的 src。"""
+    try:
+        return sb.execute_script('''
+            return (function() {
+                var a = document.querySelector("iframe[src*='recaptcha/api2/anchor']");
+                var b = document.querySelector("iframe[src*='recaptcha/api2/bframe']");
+                return {
+                    anchor: a ? a.src : "",
+                    bframe: b ? b.src : "",
+                    challenge: document.querySelector("textarea[name='g-recaptcha-response']")
+                        ? document.querySelector("textarea[name='g-recaptcha-response']").value : ""
+                };
+            })()
+        ''') or {}
+    except:
+        return {}
+
+def switch_to_recaptcha_bframe(sb) -> Optional[str]:
+    """
+    给 bframe iframe 加 id，切换到该 frame，返回原始 window handle。
+    之后必须调用 exit_recaptcha_bframe 还原。
+    """
+    try:
+        ok = sb.execute_script('''
+            return (function() {
+                var b = document.querySelector("iframe[src*='recaptcha/api2/bframe']");
+                if (!b) return false;
+                b.id = "__rc_bframe__";
+                return true;
+            })()
+        ''')
+        if not ok:
+            print("  [WARN] 未找到 reCAPTCHA bframe")
+            return None
+
+        origin_handle = sb.driver.current_window_handle
+        sb.driver.switch_to.default_content()
+        sb.driver.switch_to.frame(sb.driver.find_element("css selector", "#__rc_bframe__"))
+        time.sleep(0.5)
+        return origin_handle
+    except Exception as e:
+        print(f"  [WARN] 切换到 bframe 失败: {e}")
+        try:
+            sb.driver.switch_to.default_content()
+        except Exception:
+            pass
+        return None
+
+def exit_recaptcha_bframe(sb, origin_handle: Optional[str]):
+    if not origin_handle:
+        return
+    try:
+        sb.driver.switch_to.default_content()
+        sb.driver.switch_to.window(origin_handle)
+    except Exception as e:
+        print(f"  [WARN] 还原 frame 失败: {e}")
+
+def click_recaptcha_audio_button(sb, wait: int = 15) -> bool:
+    """在 bframe 内点击耳机图标切到语音挑战（等元素就绪）。"""
+    js = '''
+        return (function() {
+            var ids = ["recaptcha-audio-button", "audio-button"];
+            for (var i = 0; i < ids.length; i++) {
+                var el = document.getElementById(ids[i]);
+                if (el && el.offsetParent !== null) { el.click(); return "id:" + ids[i]; }
+            }
+            var btns = document.querySelectorAll("button, a, div[role='button']");
+            for (var j = 0; j < btns.length; j++) {
+                var t = (btns[j].innerText || "").toLowerCase()
+                      + (btns[j].title || "").toLowerCase()
+                      + (btns[j].getAttribute("aria-label") || "").toLowerCase();
+                if (t.indexOf("audio") > -1 || t.indexOf("voice") > -1) {
+                    btns[j].click();
+                    return "text:audio";
+                }
+            }
+            return "";
+        })()
+    '''
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        try:
+            r = sb.execute_script(js)
+            if r:
+                print(f"  [INFO] 切换到语音验证 ({r})")
+                return True
+        except Exception:
+            pass
+        time.sleep(1)
+
+    print("  [WARN] 未找到语音切换按钮")
+    return False
+
+def get_recaptcha_audio_url(sb, timeout: int = 30) -> Optional[str]:
+    """从 bframe 的 audio source 取 mp3 直链（可能是 blob:）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            info = sb.execute_script('''
+                return (function() {
+                    var body = document.body ? document.body.innerText : "";
+                    var blocked = body.indexOf("Try again later") > -1 ||
+                                  body.indexOf("automated queries") > -1;
+                    var a = document.querySelector("audio#audio-source, audio source, audio");
+                    if (!a) return { url: "", blocked: blocked };
+                    var src = a.getAttribute("src") || a.src || "";
+                    if (!src) {
+                        var s = a.querySelector("source");
+                        src = s ? (s.getAttribute("src") || s.src || "") : "";
+                    }
+                    return { url: src || "", blocked: blocked };
+                })()
+            ''') or {}
+
+            if info.get("blocked"):
+                print("  [WARN] Google 拒绝了音频请求（自动化判定，需换出口 IP）")
+                return "__BLOCKED__"
+
+            if info.get("url"):
+                return str(info["url"])
+        except Exception:
+            pass
+        time.sleep(1)
+    return None
+
+def download_recaptcha_audio(sb, url: str) -> Optional[Path]:
+    """
+    blob: 直链用浏览器内 fetch + FileReader 转 base64 落地；
+    http(s) 直链直接 requests 下载。
+    """
+    AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    out = AUDIO_DIR / f"rc_{int(time.time()*1000)}.mp3"
+
+    if url.startswith("blob:") or url.startswith("data:"):
+        try:
+            b64 = sb.driver.execute_async_script('''
+                var src = arguments[0];
+                var done = arguments[arguments.length - 1];
+                fetch(src)
+                    .then(function(r) { return r.arrayBuffer(); })
+                    .then(function(buf) {
+                        var bytes = new Uint8Array(buf);
+                        var bin = "";
+                        for (var i = 0; i < bytes.length; i++) {
+                            bin += String.fromCharCode(bytes[i]);
+                        }
+                        done(btoa(bin));
+                    })
+                    .catch(function(e) { done(""); });
+            ''', url)
+            if not b64:
+                print("  [WARN] blob 音频读取为空")
+                return None
+            import base64 as _b64
+            out.write_bytes(_b64.b64decode(b64))
+            print(f"  [INFO] 音频已落地 {out.name} ({out.stat().st_size} bytes)")
+            return out
+        except Exception as e:
+            print(f"  [WARN] blob 音频落地失败: {e}")
+            return None
+
+    try:
+        r = requests.get(url, timeout=30, headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://www.google.com/",
+        })
+        if r.status_code != 200 or not r.content:
+            print(f"  [WARN] 音频下载失败 HTTP {r.status_code}")
+            return None
+        out.write_bytes(r.content)
+        print(f"  [INFO] 音频已下载 {out.name} ({len(r.content)} bytes)")
+        return out
+    except Exception as e:
+        print(f"  [WARN] 音频下载异常: {e}")
+        return None
+
+def ensure_vosk_model() -> Optional[str]:
+    """下载并解压 Vosk 小模型（约 40MB），返回模型目录。"""
+    if VOSK_MODEL_DIR.exists() and (VOSK_MODEL_DIR / "am").exists():
+        return str(VOSK_MODEL_DIR)
+
+    if not VOSK_MODEL_ZIP.exists():
+        print("  [INFO] 下载 Vosk 语音模型...")
+        try:
+            with requests.get(VOSK_MODEL_URL, stream=True, timeout=180) as r:
+                r.raise_for_status()
+                with open(VOSK_MODEL_ZIP, "wb") as f:
+                    for chunk in r.iter_content(1 << 16):
+                        f.write(chunk)
+        except Exception as e:
+            print(f"  [WARN] Vosk 模型下载失败: {e}")
+            return None
+
+    try:
+        import zipfile
+        with zipfile.ZipFile(VOSK_MODEL_ZIP) as z:
+            z.extractall("/tmp")
+        print("  [INFO] Vosk 模型解压完成")
+        return str(VOSK_MODEL_DIR)
+    except Exception as e:
+        print(f"  [WARN] Vosk 模型解压失败: {e}")
+        return None
+
+def transcribe_recaptcha_audio(mp3_path: Path) -> str:
+    """mp3 → 16k 单声道 wav → Vosk 识别 → 纯数字串。"""
+    import subprocess, json as _json
+
+    wav = mp3_path.with_suffix(".wav")
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(mp3_path),
+             "-ar", "16000", "-ac", "1", str(wav)],
+            check=True, timeout=60,
+        )
+    except Exception as e:
+        print(f"  [WARN] ffmpeg 转码失败: {e}")
+        return ""
+
+    model_dir = ensure_vosk_model()
+    if not model_dir:
+        return ""
+
+    try:
+        import vosk, wave
+        wf = wave.open(str(wav), "rb")
+        rec = vosk.KaldiRecognizer(vosk.Model(model_dir), wf.getframerate())
+        rec.SetWords(True)
+        while True:
+            data = wf.readframes(4000)
+            if not data:
+                break
+            rec.AcceptWaveform(data)
+        raw = _json.loads(rec.FinalResult()).get("text", "")
+    except Exception as e:
+        print(f"  [WARN] Vosk 识别失败: {e}")
+        return ""
+
+    words = [w.strip(".,!?") for w in raw.lower().split() if w.strip()]
+    digits = "".join(_NUM_WORDS.get(w, "") for w in words)
+    if not digits:
+        # 兜底：识别结果里的裸数字
+        digits = "".join(ch for ch in raw if ch.isdigit())
+
+    print(f"  [INFO] 识别原文: {raw!r} → 数字: {digits or '<空>'}")
+    return digits
+
+def fill_recaptcha_answer(sb, answer: str) -> bool:
+    """在 bframe 里填答案并点验证。"""
+    js = '''
+        var ans = arguments[0];
+        var inp = document.getElementById("audio-response");
+        if (!inp) return false;
+        inp.value = ans;
+        inp.dispatchEvent(new Event("input", {bubbles: true}));
+        inp.dispatchEvent(new Event("change", {bubbles: true}));
+        var btn = document.getElementById("recaptcha-verify-button")
+               || document.querySelector("button#recaptcha-verify-button")
+               || document.querySelector("button[id*='verify']");
+        if (btn) { btn.click(); return true; }
+        return false;
+    '''
+    try:
+        return bool(sb.execute_script(js, answer))
+    except Exception as e:
+        print(f"  [WARN] 填写答案异常: {e}")
+        return False
+
+def verify_recaptcha_token(sb) -> bool:
+    """检查主文档 textarea 里是否拿到了 recaptcha token。"""
+    try:
+        return bool(sb.execute_script('''
+            return (function() {
+                var t = document.querySelector("textarea[name='g-recaptcha-response']");
+                if (t && t.value && t.value.length > 100) return true;
+                var all = document.querySelectorAll("textarea[id^='g-recaptcha-response']");
+                for (var i = 0; i < all.length; i++) {
+                    if (all[i].value && all[i].value.length > 100) return true;
+                }
+                return false;
+            })()
+        '''))
+    except:
+        return False
+
+def is_recaptcha_challenge_ready(sb) -> bool:
+    """bframe 内是否已经出现挑战元素（图片题或语音面板）。"""
+    origin_handle = switch_to_recaptcha_bframe(sb)
+    if not origin_handle:
+        return False
+    try:
+        return bool(sb.execute_script('''
+            return (function() {
+                if (document.getElementById("recaptcha-audio-button")) return true;
+                if (document.getElementById("audio-source")) return true;
+                if (document.getElementById("recaptcha-image-button")) return true;
+                if (document.querySelector(".rc-imageselect-target")) return true;
+                return false;
+            })()
+        '''))
+    except Exception:
+        return False
+    finally:
+        exit_recaptcha_bframe(sb, origin_handle)
+
+def click_recaptcha_anchor(sb) -> bool:
+    """点击 anchor 里的『I'm not a robot』复选框，唤起挑战面板。"""
+    try:
+        origin_handle = sb.driver.current_window_handle
+        ok = sb.execute_script('''
+            return (function() {
+                var a = document.querySelector("iframe[src*='recaptcha/api2/anchor']");
+                if (!a) return false;
+                a.id = "__rc_anchor__";
+                return true;
+            })()
+        ''')
+        if not ok:
+            return False
+
+        sb.driver.switch_to.default_content()
+        sb.driver.switch_to.frame(
+            sb.driver.find_element("css selector", "#__rc_anchor__")
+        )
+        clicked = sb.execute_script('''
+            return (function() {
+                var c = document.getElementById("recaptcha-anchor");
+                if (c) { c.click(); return true; }
+                var box = document.querySelector(".recaptcha-checkbox-border, #recaptcha-anchor-label");
+                if (box) { box.click(); return true; }
+                return false;
+            })()
+        ''')
+        exit_recaptcha_bframe(sb, origin_handle)
+        if clicked:
+            print("  [INFO] 已点击 reCAPTCHA 复选框")
+        return bool(clicked)
+    except Exception as e:
+        print(f"  [WARN] 点击复选框异常: {e}")
+        try:
+            sb.driver.switch_to.default_content()
+        except Exception:
+            pass
+        return False
+
+def solve_recaptcha_audio(sb, idx: int, max_attempts: int = 3) -> bool:
+    """
+    reCAPTCHA 语音挑战全流程：
+    bframe → 切语音 → 下载 mp3 → Vosk 离线识别 → 回填验证。
+    """
+    print("  [INFO] 检测到 reCAPTCHA，走语音识别通道")
+
+    if verify_recaptcha_token(sb):
+        print("  [INFO] reCAPTCHA token 已存在，无需处理")
+        return True
+
+    # 1. 唤起挑战面板
+    frames = get_recaptcha_frames(sb)
+    if not frames.get("bframe"):
+        click_recaptcha_anchor(sb)
+        time.sleep(3)
+
+    # 面板可能已打开但没有题目内容，先确认 bframe 内有挑战元素
+    if not is_recaptcha_challenge_ready(sb):
+        click_recaptcha_anchor(sb)
+        time.sleep(3)
+
+    for attempt in range(1, max_attempts + 1):
+        print(f"  [INFO] reCAPTCHA 语音尝试 {attempt}/{max_attempts}")
+
+        origin_handle = switch_to_recaptcha_bframe(sb)
+        if not origin_handle:
+            return False
+
+        try:
+            click_recaptcha_audio_button(sb)
+            time.sleep(2)
+
+            audio_url = get_recaptcha_audio_url(sb, timeout=25)
+            if audio_url == "__BLOCKED__":
+                exit_recaptcha_bframe(sb, origin_handle)
+                print("  [ERROR] 出口 IP 被 Google 判定为自动化，语音通道不可用")
+                return False
+            if not audio_url:
+                print("  [WARN] 未取到音频链接")
+                exit_recaptcha_bframe(sb, origin_handle)
+                time.sleep(2)
+                continue
+
+            print(f"  [INFO] 音频链接 {(audio_url[:60])}...")
+            path = download_recaptcha_audio(sb, audio_url)
+            exit_recaptcha_bframe(sb, origin_handle)
+            if not path:
+                continue
+
+            answer = transcribe_recaptcha_audio(path)
+            if not answer:
+                print("  [WARN] 识别为空，重新取音频")
+                continue
+
+            # 重新进入 bframe 回填
+            origin_handle = switch_to_recaptcha_bframe(sb)
+            if not origin_handle:
+                return False
+            ok = fill_recaptcha_answer(sb, answer)
+            exit_recaptcha_bframe(sb, origin_handle)
+            if not ok:
+                print("  [WARN] 回填答案失败")
+                continue
+
+            print(f"  [INFO] 已提交答案 {answer}")
+            time.sleep(4)
+
+            if verify_recaptcha_token(sb):
+                print("  [INFO] reCAPTCHA 验证通过")
+                return True
+
+            # 未通过时点一下刷新换题
+            origin_handle = switch_to_recaptcha_bframe(sb)
+            if origin_handle:
+                try:
+                    sb.execute_script('''
+                        return (function() {
+                            var b = document.getElementById("recaptcha-reload-button");
+                            if (b) b.click();
+                        })()
+                    ''')
+                except Exception:
+                    pass
+                exit_recaptcha_bframe(sb, origin_handle)
+            time.sleep(3)
+
+        except Exception as e:
+            exit_recaptcha_bframe(sb, origin_handle)
+            print(f"  [WARN] 语音流程异常: {e}")
+            time.sleep(2)
+
+    print("  [WARN] reCAPTCHA 语音验证未通过")
+    return False
+
 def check_renew_modal_open(sb) -> bool:
     try:
         return bool(sb.execute_script('''
@@ -316,6 +787,12 @@ def check_renew_modal_open(sb) -> bool:
                     'iframe[src*="turnstile"], iframe[src*="challenges.cloudflare"]'
                 );
                 if (iframes.length > 0) return true;
+
+                // 2b. reCAPTCHA iframe（CF 盾被替换成 RE 盾）
+                var rc = document.querySelectorAll(
+                    'iframe[src*="recaptcha"], .g-recaptcha, textarea[name="g-recaptcha-response"]'
+                );
+                if (rc.length > 0) return true;
 
                 // 3. hidden response（新版已经直接出现 input）
                 var input = document.querySelector(
@@ -471,7 +948,7 @@ def handle_social_prompt(sb, idx: int) -> bool:
         return False
 
 def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
-    print("  [INFO] 等待 Turnstile...")
+    print("  [INFO] 等待验证组件...")
     time.sleep(2)
 
     dismiss_cookie_only(sb)
@@ -480,6 +957,23 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
     modal_open = check_renew_modal_open(sb)
     print(f"  [INFO] 续期弹窗: {'已打开' if modal_open else '未检测到'}")
 
+    # ==========================================================
+    # 分支 1：reCAPTCHA（CF 盾已换成 RE 盾）
+    # ==========================================================
+    if is_recaptcha_present(sb):
+        ok = solve_recaptcha_audio(sb, idx, max_attempts=3)
+        safe_screenshot(sb, shot(idx, f"server_{sid_f}_recaptcha"))
+        if ok:
+            return True
+        if not check_renew_modal_open(sb):
+            print("  [INFO] 弹窗已关闭，续期已提交")
+            return True
+        print("  [WARN] reCAPTCHA 语音通道未通过")
+        return False
+
+    # ==========================================================
+    # 分支 2：Cloudflare Turnstile
+    # ==========================================================
     if check_turnstile_done(sb):
         print("  [INFO] Turnstile 已完成")
         return True
@@ -945,18 +1439,32 @@ def login(sb, user: str, pwd: str, idx: int) -> Tuple[bool, Optional[str]]:
                     document.querySelector(
                         "[id*='cf-chl-widget']"
                     )
+                    ||
+                    document.querySelector(
+                        "iframe[src*='recaptcha']"
+                    )
+                    ||
+                    document.querySelector(
+                        "textarea[name='g-recaptcha-response']"
+                    )
                 );
             """)
 
             # ==========================================================
-            # 处理 Turnstile
+            # 处理 Turnstile / reCAPTCHA
             # ==========================================================
-            if has_ts:
-                print("  [INFO] 检测到 Turnstile，尝试处理...")
+            if has_ts or is_recaptcha_present(sb):
+                print("  [INFO] 检测到验证组件，尝试处理...")
 
                 turnstile_done = False
 
-                for t_attempt in range(3):
+                # reCAPTCHA 优先走语音识别通道
+                if is_recaptcha_present(sb):
+                    turnstile_done = solve_recaptcha_audio(sb, idx, max_attempts=3)
+                    if turnstile_done:
+                        print("  [INFO] reCAPTCHA 已通过（语音通道）")
+
+                for t_attempt in range(3 if not turnstile_done else 0):
                     print(
                         f"  [INFO] Turnstile 点击 "
                         f"({t_attempt + 1}/3)"
