@@ -1227,6 +1227,30 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
         print("  [INFO] Turnstile 已完成")
         return True
 
+    # 清掉弹窗外的残留 Turnstile（登录页遗留 iframe 会让
+    # uc_gui_click_captcha 点到隐藏 widget 上，坐标全空转）
+    try:
+        removed = sb.execute_script('''
+            return (function() {
+                var n = 0;
+                var sel = "input[name='cf-turnstile-response'], " +
+                          "[id*='cf-chl-widget'], .cf-turnstile, " +
+                          "iframe[src*='challenges.cloudflare.com']";
+                document.querySelectorAll(sel).forEach(function(el) {
+                    // 保留续期弹窗自己的容器及其后代
+                    if (el.closest("#turnstile-container-renew")) return;
+                    var box = el.closest("div") || el;
+                    box.remove();
+                    n++;
+                });
+                return n;
+            })()
+        ''')
+        if removed:
+            print(f"  [INFO] 已清理弹窗外残留 Turnstile 节点: {removed} 个")
+    except Exception as e:
+        print(f"  [WARN] 清理残留 Turnstile 失败: {e}")
+
     print("  [INFO] 处理 Turnstile 验证...")
     for attempt in range(3):
         print(f"  [INFO] 坐标计算完成 (第{attempt+1}次)")
