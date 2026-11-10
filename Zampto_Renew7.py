@@ -1277,10 +1277,24 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
             try:
                 box = sb.execute_script('''
                     (function() {
-                        var f = document.querySelector(
-                            "iframe[src*='challenges.cloudflare.com']");
-                        if (!f) return null;
-                        var r = f.getBoundingClientRect();
+                        // turnstile iframe 挂在 shadow DOM 里,需穿透查找
+                        var found = null;
+                        function pierce(root) {
+                            if (found) return;
+                            var els = root.querySelectorAll("*");
+                            for (var i = 0; i < els.length; i++) {
+                                var el = els[i];
+                                if (el.tagName === "IFRAME" &&
+                                    (el.src || "").indexOf("challenges.cloudflare.com") > -1) {
+                                    found = el;
+                                    return;
+                                }
+                                if (el.shadowRoot) pierce(el.shadowRoot);
+                            }
+                        }
+                        pierce(document);
+                        if (!found) return null;
+                        var r = found.getBoundingClientRect();
                         return {x: r.x + r.width / 2, y: r.y + r.height / 2,
                                 w: r.width, h: r.height};
                     })()
