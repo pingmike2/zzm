@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '45 6,18 * * *'  # 每天北京时间 11:45 运行
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'Zampto_Renew7.py'
+      - '.github/workflows/Zampto_Renew7.yml'
 
 jobs:
   renew:
