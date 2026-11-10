@@ -321,7 +321,7 @@ def is_recaptcha_present(sb) -> bool:
     """检测弹窗内是否为 reCAPTCHA（而不是 Cloudflare Turnstile）。"""
     try:
         return bool(sb.execute_script('''
-            return (function() {
+            (function() {
                 // 1. reCAPTCHA 的 iframe（anchor / bframe / enterprise / 旧版 challenge）
                 var ifr = document.querySelectorAll(
                     "iframe[src*='recaptcha'], iframe[src*='google.com/recaptcha'], " +
@@ -360,7 +360,7 @@ def detect_captcha_kind(sb) -> str:
     """返回当前验证组件类型：recaptcha / turnstile / none。"""
     try:
         kind = sb.execute_script('''
-            return (function() {
+            (function() {
                 function scan(root) {
                     var out = { rc: false, ts: false, googleFrame: false };
                     var frames = root.querySelectorAll ? root.querySelectorAll("iframe") : [];
@@ -419,7 +419,7 @@ def get_recaptcha_frames(sb) -> Dict[str, str]:
     """返回 anchor / bframe 两个 iframe 的 src。"""
     try:
         return sb.execute_script('''
-            return (function() {
+            (function() {
                 var a = document.querySelector("iframe[src*='recaptcha/api2/anchor']");
                 var b = document.querySelector("iframe[src*='recaptcha/api2/bframe']");
                 return {
@@ -440,7 +440,7 @@ def switch_to_recaptcha_bframe(sb) -> Optional[str]:
     """
     try:
         ok = sb.execute_script('''
-            return (function() {
+            (function() {
                 var b = document.querySelector("iframe[src*='recaptcha/api2/bframe']");
                 if (!b) return false;
                 b.id = "__rc_bframe__";
@@ -476,7 +476,7 @@ def exit_recaptcha_bframe(sb, origin_handle: Optional[str]):
 def click_recaptcha_audio_button(sb, wait: int = 15) -> bool:
     """在 bframe 内点击耳机图标切到语音挑战（等元素就绪）。"""
     js = '''
-        return (function() {
+        (function() {
             var ids = ["recaptcha-audio-button", "audio-button"];
             for (var i = 0; i < ids.length; i++) {
                 var el = document.getElementById(ids[i]);
@@ -520,7 +520,7 @@ def get_recaptcha_audio_url(sb, timeout: int = 30) -> Optional[str]:
     while time.time() < deadline:
         try:
             info = sb.execute_script('''
-                return (function() {
+                (function() {
                     var body = document.body ? document.body.innerText : "";
                     var blocked =
                         !!document.querySelector(".rc-doscaptcha-header-text") ||
@@ -565,7 +565,7 @@ def is_recaptcha_blocked(sb) -> bool:
     """bframe 内是否出现封禁提示（doscaptcha / 音频错误信息）。"""
     try:
         return bool(sb.execute_script('''
-            return (function() {
+            (function() {
                 var h = document.querySelector(".rc-doscaptcha-header-text");
                 if (h && h.textContent.toLowerCase().indexOf("try again later") > -1) return true;
                 var e = document.querySelector(".rc-audiochallenge-error-message");
@@ -583,7 +583,7 @@ def is_audio_mode(sb) -> bool:
         return False
     try:
         return bool(sb.execute_script('''
-            return (function() {
+            (function() {
                 var i = document.getElementById("audio-response");
                 return !!(i && i.offsetParent !== null);
             })()
@@ -740,7 +740,7 @@ def fill_recaptcha_answer(sb, answer: str) -> bool:
         return true;
     '''
     js_verify = '''
-        return (function() {
+        (function() {
             var btn = document.getElementById("recaptcha-verify-button");
             if (btn) { btn.click(); return true; }
             return false;
@@ -759,7 +759,7 @@ def verify_recaptcha_token(sb) -> bool:
     """检查主文档 textarea 里是否拿到了 recaptcha token。"""
     try:
         return bool(sb.execute_script('''
-            return (function() {
+            (function() {
                 var t = document.querySelector("textarea[name='g-recaptcha-response']");
                 if (t && t.value && t.value.length > 100) return true;
                 var all = document.querySelectorAll("textarea[id^='g-recaptcha-response']");
@@ -779,7 +779,7 @@ def is_recaptcha_challenge_ready(sb) -> bool:
         return False
     try:
         return bool(sb.execute_script('''
-            return (function() {
+            (function() {
                 if (document.getElementById("recaptcha-audio-button")) return true;
                 if (document.getElementById("audio-source")) return true;
                 if (document.getElementById("recaptcha-image-button")) return true;
@@ -797,7 +797,7 @@ def click_recaptcha_anchor(sb) -> bool:
     try:
         origin_handle = sb.driver.current_window_handle
         ok = sb.execute_script('''
-            return (function() {
+            (function() {
                 var a = document.querySelector("iframe[src*='recaptcha/api2/anchor']");
                 if (!a) return false;
                 a.id = "__rc_anchor__";
@@ -812,7 +812,7 @@ def click_recaptcha_anchor(sb) -> bool:
             sb.driver.find_element("css selector", "#__rc_anchor__")
         )
         clicked = sb.execute_script('''
-            return (function() {
+            (function() {
                 var c = document.getElementById("recaptcha-anchor");
                 if (c) { c.click(); return true; }
                 var box = document.querySelector(".recaptcha-checkbox-border, #recaptcha-anchor-label");
@@ -918,7 +918,7 @@ def solve_recaptcha_audio(sb, idx: int, max_attempts: int = 3) -> bool:
             if origin_handle:
                 try:
                     sb.execute_script('''
-                        return (function() {
+                        (function() {
                             var b = document.getElementById("recaptcha-reload-button");
                             if (b) b.click();
                         })()
@@ -940,7 +940,7 @@ def check_turnstile_like_dom(sb) -> bool:
     """弹窗里是否存在 Turnstile 风格的容器（用于 kind=none 时的兜底）。"""
     try:
         return bool(sb.execute_script('''
-            return (function() {
+            (function() {
                 if (document.querySelector("#turnstile-container-renew")) return true;
                 if (document.querySelector("input[name='cf-turnstile-response']")) return true;
                 if (document.querySelector("[id*='cf-chl-widget']")) return true;
@@ -1179,7 +1179,7 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
             print(f"  [DEBUG] 弹窗 HTML 落盘失败: {e}")
         try:
             iframes_info = sb.execute_script('''
-                return (function() {
+                (function() {
                     var o = [];
                     document.querySelectorAll("iframe").forEach(function(f) {
                         o.push({src: (f.src || "").slice(0, 120),
@@ -1231,13 +1231,12 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
     # uc_gui_click_captcha 点到隐藏 widget 上，坐标全空转）
     try:
         removed = sb.execute_script('''
-            return (function() {
+            (function() {
                 var n = 0;
                 var sel = "input[name='cf-turnstile-response'], " +
                           "[id*='cf-chl-widget'], .cf-turnstile, " +
                           "iframe[src*='challenges.cloudflare.com']";
                 document.querySelectorAll(sel).forEach(function(el) {
-                    // 保留续期弹窗自己的容器及其后代
                     if (el.closest("#turnstile-container-renew")) return;
                     var box = el.closest("div") || el;
                     box.remove();
