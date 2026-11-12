@@ -1155,6 +1155,28 @@ fetch('/api/server/renew', {
 
 
 
+
+def safe_goto(sb, url: str, wait: float = 6.0, retries: int = 2) -> bool:
+    """
+    用 CDP Page.navigate 导航，绕开 sb.open。
+
+    sb.open 会带上 SeleniumBase 的自动化特征，dash.zampto.net 检测到后
+    直接把整个 Chrome 进程杀掉（实测 ps 里 chrome 进程数归零），
+    后续所有 driver 调用都变成 ConnectionRefused。
+    """
+    for _ in range(retries + 1):
+        try:
+            sb.driver.execute_cdp_cmd("Page.navigate", {"url": url})
+            time.sleep(wait)
+            # 探活：能取到 location 说明会话还在
+            sb.driver.execute_script("return 1;")
+            return True
+        except Exception as e:
+            print("  [WARN] CDP 导航失败: %s: %s" % (type(e).__name__, str(e)[:80]))
+            time.sleep(2)
+    return False
+
+
 def _renew_by_nonecap(sb, sid: str, idx: int = 0, real_sid=None) -> bool:
     """
     NoneCap 通道：第三方 captcha solving API 出 hCaptcha token，
@@ -1196,6 +1218,11 @@ def _renew_by_nonecap(sb, sid: str, idx: int = 0, real_sid=None) -> bool:
         print("  [WARN] 无法确定 server_id，NoneCap 通道跳过")
         return False
     page_url = SERVER_URL.format(sid_i)
+
+    # ---- 0. 用 CDP 导航到详情页（sb.open 会被站点识别并杀掉浏览器）----
+    if not safe_goto(sb, page_url, wait=6.0):
+        print("  [WARN] 详情页导航失败，NoneCap 通道跳过")
+        return False
 
     # ---- 1. renew/start 探针：拿 allowed 与 hcaptchaSiteKey ----
     try:
@@ -1300,8 +1327,8 @@ def solve_hcaptcha(sb, idx: int, sid_f: str = "", max_rounds: int = 6, server_id
     if _renew_by_nonecap(sb, sid_f, idx, real_sid=server_id):
         return True
 
-    # 次选：hcaptcha_challenger 库（Playwright 驱动，XHR 拦截 + 网格坐标）
-    if os.environ.get("HCAP_LIB", "1") == "1":
+    # 次选：hcaptcha_challenger 库（需要视觉模型，未配置则直接跳过）
+    if os.environ.get("HCAP_LIB", "0") == "1" and os.environ.get("OPENAI_API_KEY"):
         try:
             if _solve_hcaptcha_via_lib(sb):
                 print("  [INFO] hCaptcha 已通过（hcaptcha_challenger）")
@@ -1309,6 +1336,10 @@ def solve_hcaptcha(sb, idx: int, sid_f: str = "", max_rounds: int = 6, server_id
             print("  [INFO] hcaptcha_challenger 未通过，回退旧通道")
         except Exception as e:
             print(f"  [WARN] hcaptcha_challenger 异常: {e}")
+
+    if not (os.environ.get("AI_BASE_URL") or os.environ.get("OPENAI_API_KEY")):
+        print("  [WARN] 未配置视觉模型（AI_BASE_URL / OPENAI_API_KEY），hCaptcha 无可用通道")
+        return False
 
     print("  [INFO] 检测到 hCaptcha，走 AI 图像通道")
 
