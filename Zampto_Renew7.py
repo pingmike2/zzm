@@ -1155,7 +1155,7 @@ fetch('/api/server/renew', {
 
 
 
-def _renew_by_nonecap(sb, sid: str, idx: int = 0) -> bool:
+def _renew_by_nonecap(sb, sid: str, idx: int = 0, real_sid=None) -> bool:
     """
     NoneCap 通道：第三方 captcha solving API 出 hCaptcha token，
     然后直接 POST /api/server/renew（端点取自 _next chunk a1e047a237fa8772.js）。
@@ -1188,8 +1188,13 @@ def _renew_by_nonecap(sb, sid: str, idx: int = 0) -> bool:
             or "https://api.nonecap.com/v1").rstrip("/")
     np_proxy = (os.environ.get("NONECAP_PROXY") or "").strip() or None
     hdr = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
-    page_url = SERVER_URL.format(sid)
-    sid_i = int(sid) if str(sid).isdigit() else 0
+    # sid 可能是打码后的文件名（7x71），真实 id 由调用方传入
+    _raw = str(real_sid if real_sid is not None else sid)
+    sid_i = int(_raw) if _raw.isdigit() else 0
+    if not sid_i:
+        print("  [WARN] 无法确定 server_id，NoneCap 通道跳过")
+        return False
+    page_url = SERVER_URL.format(sid_i)
 
     # ---- 1. renew/start 探针：拿 allowed 与 hcaptchaSiteKey ----
     try:
@@ -1275,7 +1280,7 @@ def _renew_by_nonecap(sb, sid: str, idx: int = 0) -> bool:
     return False
 
 
-def solve_hcaptcha(sb, idx: int, sid_f: str = "", max_rounds: int = 6) -> bool:
+def solve_hcaptcha(sb, idx: int, sid_f: str = "", max_rounds: int = 6, server_id=None) -> bool:
     """
     hCaptcha 通道：
       1. DP attach 同一浏览器，点 checkbox frame 里的勾选框
@@ -1284,7 +1289,7 @@ def solve_hcaptcha(sb, idx: int, sid_f: str = "", max_rounds: int = 6) -> bool:
       4. 每轮结束复查 token
     """
     # 首选：NoneCap API（第三方求解 + 直接打 renew 接口，最快最稳）
-    if _renew_by_nonecap(sb, sid, idx):
+    if _renew_by_nonecap(sb, sid_f, idx, real_sid=server_id):
         return True
 
     # 次选：hcaptcha_challenger 库（Playwright 驱动，XHR 拦截 + 网格坐标）
@@ -2179,7 +2184,7 @@ def handle_social_prompt(sb, idx: int) -> bool:
         print(f"  [WARN] 处理社交提示页面异常: {e}")
         return False
 
-def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
+def handle_turnstile(sb, idx: int, sid_f: str, real_sid=None) -> bool:
     print("  [INFO] 等待验证组件...")
     time.sleep(2)
 
@@ -2254,7 +2259,7 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
     # 复选框 → 无障碍直接过；出图像挑战则截图交 AI 判点位点击
     # ==========================================================
     if kind == "hcaptcha":
-        ok = solve_hcaptcha(sb, idx, sid_f)
+        ok = solve_hcaptcha(sb, idx, sid_f, server_id=real_sid)
         safe_screenshot(sb, shot(idx, f"server_{sid_f}_hcaptcha"))
         if ok:
             return True
@@ -3412,7 +3417,7 @@ def renew(sb, sid: str, idx: int, username: str) -> Dict[str, Any]:
 
     time.sleep(3)
 
-    handle_turnstile(sb, idx, sid_f)
+    handle_turnstile(sb, idx, sid_f, real_sid=sid)
     time.sleep(5)
 
     safe_screenshot(sb, shot(idx, f"server_{sid_f}_result"))
