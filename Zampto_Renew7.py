@@ -841,6 +841,838 @@ def click_recaptcha_anchor(sb) -> bool:
             pass
         return False
 
+def _hcap_odd_icon_point(b64: str, region=None):
+    """找 hCaptcha 单图挑战里那个「不一样」的图标，返回相对图片的 (x, y)。"""
+    try:
+        import base64 as _b64
+        import io
+
+        import numpy as np
+        from PIL import Image
+
+        im = Image.open(io.BytesIO(_b64.b64decode(b64))).convert("RGB")
+        if region:
+            rx, ry, rw, rh = region
+            im = im.crop((int(rx), int(ry), int(rx + rw), int(ry + rh)))
+        a = np.asarray(im).astype(np.float32)
+        mx = a.max(axis=2)
+        mn = a.min(axis=2)
+        sat = (mx - mn) / np.maximum(mx, 1.0)
+        val = mx / 255.0
+
+        # 1) 先找彩色实心图标（低多边形背景是低饱和的）
+        mask = (sat > 0.40) & (val > 0.10) & (val < 0.98)
+        if mask.sum() < 60:
+            # 2) 退路：唯一的深色实心块（灰线稿里的异类）
+            mask = (val < 0.38) & (sat < 0.55)
+        if mask.sum() < 60:
+            return None
+
+        ys, xs = np.nonzero(mask)
+        cell = 24
+        grid = {}
+        for x, y in zip(xs, ys):
+            k = (int(x) // cell, int(y) // cell)
+            grid[k] = grid.get(k, 0) + 1
+        kx, ky = max(grid.items(), key=lambda kv: kv[1])[0]
+        sel = (xs // cell == kx) & (ys // cell == ky)
+        return float(xs[sel].mean()), float(ys[sel].mean())
+    except Exception as e:
+        print(f"  [WARN] 图像定位失败: {e}")
+        return None
+
+
+def _ai_vision(prompt: str, images) -> str:
+    """
+    调 AI 视觉后端理解图像，返回文本。
+    环境变量：
+      AI_BASE_URL / AI_API_KEY  —— 主对端（任意 OpenAI 兼容 /v1）
+      AI_VISION_MODEL           —— 主对端模型名，默认 muse-spark
+      AI_FALLBACK_URL / AI_FALLBACK_KEY / AI_FALLBACK_MODEL
+                                —— 备用视觉后端（主对端拒答/失败时启用）
+    images 可为单张 base64 或 base64 列表（动态题多帧）。
+    """
+    if isinstance(images, str):
+        images = [images]
+
+    px = os.environ.get("PROXY_SOCKS5", "")
+    proxies = ({"http": px.replace("socks5://", "socks5h://"),
+                "https": px.replace("socks5://", "socks5h://")}
+               if px else None)
+
+    def _call(base, key, model):
+        content = [{"type": "text", "text": prompt}]
+        for b in images:
+            content.append({"type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{b}"}})
+        payload = {"model": model,
+                   "messages": [{"role": "user", "content": content}],
+                   "max_tokens": 3000, "temperature": 0}
+        r = requests.post(f"{base.rstrip('/')}/chat/completions",
+                          headers={"Authorization": f"Bearer {key}",
+                                   "Content-Type": "application/json"},
+                          json=payload, timeout=180, proxies=proxies)
+        if r.status_code != 200:
+            print(f"  [DEBUG] {model} HTTP {r.status_code}: {r.text[:100]}")
+            return ""
+        d = r.json()
+        msg = (d.get("choices") or [{}])[0].get("message", {})
+        txt = (msg.get("content") or "").strip()
+        if not txt:
+            # 推理型模型可能把结果留在 reasoning 里，content 为空
+            txt = (msg.get("reasoning") or "").strip()
+        return txt
+
+    # 拒答特征：模型认出验证码并拒绝解
+    REFUSAL = ("我不能", "不能帮", "无法帮", "不能描述", "不能提供",
+               "hCaptcha", "reCAPTCHA", "验证挑战", "确认你是真人",
+               "I can't", "I cannot", "I'm not able", "as an AI")
+
+    def _is_refusal(text):
+        t = text or ""
+        return any(k in t for k in REFUSAL) and not text.strip().startswith("{")
+
+    # 后端 0：cline CLI（agent 模式，模型自写脚本分析图，实测不拒答）
+    if os.environ.get("AI_CLI_DIR") and os.environ.get("AI_CLI_MODEL"):
+        out = _ai_vision_cli(prompt, images[0] if images else "")
+        if out:
+            return out
+        print("  [DEBUG] cline CLI 无结果，切主对端")
+
+    # 主对端
+    base = os.environ.get("AI_BASE_URL", "")
+    key = os.environ.get("AI_API_KEY", "")
+    model = os.environ.get("AI_VISION_MODEL", "muse-spark")
+    if base and key:
+        try:
+            out = _call(base, key, model)
+            if out and not _is_refusal(out):
+                return out
+            if out:
+                print(f"  [DEBUG] 主对端拒答({model})，切备用")
+            else:
+                print("  [DEBUG] 主对端空返回，尝试备用")
+        except Exception as e:
+            print(f"  [WARN] 主对端请求失败: {e}")
+
+    # 备用视觉后端
+    fb_url = os.environ.get("AI_FALLBACK_URL", "")
+    fb_key = os.environ.get("AI_FALLBACK_KEY", "")
+    fb_model = os.environ.get("AI_FALLBACK_MODEL", "")
+    if fb_url and fb_key and fb_model:
+        try:
+            out = _call(fb_url, fb_key, fb_model)
+            if out:
+                return out
+        except Exception as e:
+            print(f"  [WARN] 备用视觉后端失败: {e}")
+
+    return ""
+
+
+def _solve_hcaptcha_via_lib(sb, timeout: int = 180) -> bool:
+    """
+    用 hcaptcha_challenger 的 AgentV 处理当前页面的 hCaptcha。
+    需要 Playwright：通过 CDP 接上 SeleniumBase 已启动的同一个浏览器。
+    环境变量：OPENAI_BASE_URL / OPENAI_API_KEY / OPENAI_MODEL（见 AgentConfig）
+    """
+    import asyncio
+
+    from playwright.async_api import async_playwright
+
+    from hcaptcha_challenger import AgentConfig, AgentV
+    from hcaptcha_challenger.models import ChallengeSignal
+
+    dbg = sb.driver.capabilities["goog:chromeOptions"]["debuggerAddress"]
+    print(f"  [INFO] 库驱动接管 CDP {dbg}")
+    # 核对 frame URL 是否匹配库的选择器规则
+    try:
+        urls = sb.driver.execute_script("""
+            return Array.from(document.querySelectorAll('iframe'))
+                .map(function(f){ return f.src || ''; })
+                .filter(function(u){ return u.indexOf('hcaptcha') >= 0; });
+        """)
+        print(f"  [DEBUG] hCaptcha iframe 列表: {urls}")
+    except Exception as e:
+        print(f"  [DEBUG] 取 iframe 失败: {e}")
+
+    async def _run():
+        pw = await async_playwright().start()
+        try:
+            browser = await pw.chromium.connect_over_cdp(f"http://{dbg}")
+            ctx = (browser.contexts[0] if browser.contexts
+                   else await browser.new_context())
+            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            config = AgentConfig()
+            print(f"  [INFO] 库 AI 后端: {config.OPENAI_BASE_URL}"
+                  f" / {config.OPENAI_MODEL}")
+            agent = AgentV(page=page, agent_config=config)
+            sig = await asyncio.wait_for(agent.wait_for_challenge(),
+                                         timeout=timeout)
+            print(f"  [INFO] 库返回: {sig}")
+            return sig == ChallengeSignal.SUCCESS
+        finally:
+            try:
+                await pw.stop()
+            except Exception:
+                pass
+
+    try:
+        return asyncio.run(_run())
+    except RuntimeError:
+        # 已有事件循环（同线程）→ 新开线程跑
+        import threading
+        box = {}
+
+        def _t():
+            try:
+                box["r"] = asyncio.run(_run())
+            except Exception as e:
+                box["e"] = e
+
+        th = threading.Thread(target=_t)
+        th.start()
+        th.join(timeout + 30)
+        if "e" in box:
+            raise box["e"]
+        return bool(box.get("r"))
+
+
+def _ai_vision_cli(prompt: str, image_b64: str) -> str:
+    """
+    走 cline CLI 的视觉后端（agent 模式，模型会自己写脚本分析图片）。
+    环境变量：AI_CLI_DIR（cline 仓库目录）、AI_CLI_MODEL（模型名）。
+    图片落盘到临时文件，让模型读文件而不是把 base64 塞进参数。
+    """
+    cli_dir = os.environ.get("AI_CLI_DIR", "")
+    model = os.environ.get("AI_CLI_MODEL", "")
+    if not cli_dir or not model:
+        return ""
+    try:
+        import base64 as _b64
+        import subprocess as _sp
+        import tempfile
+
+        fd, img_path = tempfile.mkstemp(suffix=".png",
+                                        dir="/tmp", prefix="hcap_ai_")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(_b64.b64decode(image_b64))
+
+        task = (f"读取图片 {img_path}。\n{prompt}\n"
+                "只输出一行 JSON，不要写分析过程，不要执行其他工具。")
+        r = _sp.run(["node", "src/cli.js", "-p", "-m", model, task],
+                    cwd=cli_dir, capture_output=True, text=True, timeout=240)
+        out = (r.stdout or "") + (r.stderr or "")
+        try:
+            os.unlink(img_path)
+        except Exception:
+            pass
+        # 取最后一段含 points 的 JSON
+        import json as _json
+        import re as _re
+        for m in reversed(list(_re.finditer(r"\{[^{}]*\"points\"[^{}]*\}", out))):
+            try:
+                d = _json.loads(m.group(0))
+                if d.get("points"):
+                    return _json.dumps(d)
+            except Exception:
+                continue
+        return ""
+    except Exception as e:
+        print(f"  [WARN] cline CLI 视觉失败: {e}")
+        return ""
+
+
+def _hcap_frames(page):
+    """返回 hCaptcha 的 checkbox / challenge 两个 frame。"""
+    ck = ch = None
+    try:
+        for f in page.get_frames():
+            u = (f.url or "")
+            if "hcaptcha.com" not in u:
+                continue
+            if "checkbox" in u:
+                ck = f
+            elif "challenge" in u:
+                ch = f
+    except Exception:
+        pass
+    return ck, ch
+
+
+def _hcap_passed(page) -> bool:
+    """token 在主文档的 h-captcha-response / g-recaptcha-response 里。"""
+    for sel in ("[name='h-captcha-response']", "[name='g-recaptcha-response']"):
+        try:
+            v = page.run_js(
+                f"return (document.querySelector(\"{sel}\") || {{}}).value")
+            if v and len(str(v)) > 30:
+                return True
+        except Exception:
+            pass
+    try:
+        for f in page.get_frames():
+            if "hcaptcha.com" not in (f.url or ""):
+                continue
+            ok = f.run_js(
+                "return !!document.querySelector('.checkmark, [aria-checked=\"true\"]')")
+            if ok:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+JS_RENEW_START = """
+var cb = arguments[arguments.length - 1];
+var sid = arguments[0];
+fetch('/api/server/renew/start', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({server_id: sid})
+}).then(function (r) {
+    return r.text().then(function (t) { cb(r.status + ' :: ' + t.slice(0, 300)); });
+}).catch(function (e) { cb('ERR :: ' + e); });
+"""
+
+JS_RENEW_SUBMIT = """
+var cb = arguments[arguments.length - 1];
+var sid = arguments[0], tok = arguments[1];
+fetch('/api/server/renew', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+        server_id: sid,
+        captcha_provider: 'hcaptcha',
+        captcha_token: tok,
+        'cf-turnstile-response': tok,
+        'h-captcha-response': tok
+    })
+}).then(function (r) {
+    return r.text().then(function (t) { cb(r.status + ' :: ' + t.slice(0, 400)); });
+}).catch(function (e) { cb('ERR :: ' + e); });
+"""
+
+
+
+def _renew_by_nonecap(sb, sid: str, idx: int = 0) -> bool:
+    """
+    NoneCap 通道：第三方 captcha solving API 出 hCaptcha token，
+    然后直接 POST /api/server/renew（端点取自 _next chunk a1e047a237fa8772.js）。
+
+    完全不碰 hCaptcha widget / React 受控组件 / 图像识别：
+        POST /api/server/renew/start     -> {allowed, hcaptchaSiteKey}
+        NoneCap POST /v1/solves?wait=90  -> P1_ token
+        POST /api/server/renew           -> success
+
+    环境变量：
+        NONECAP_API_KEY   必填，Bearer token
+        NONECAP_BASE_URL  可选，默认 https://api.nonecap.com/v1
+        NONECAP_PROXY     可选，公网 socks5（NoneCap 从自己服务器出网，
+                          本地 127.0.0.1 会被拒）
+        HC_MODE           nc（默认）/ lib / off
+    """
+    if os.environ.get("HC_MODE", "nc") != "nc":
+        return False
+    key = os.environ.get("NONECAP_API_KEY", "").strip()
+    if not key:
+        print("  [INFO] NONECAP_API_KEY 未设置，跳过 NoneCap 通道")
+        return False
+    try:
+        import httpx
+    except ImportError:
+        print("  [WARN] httpx 未安装，NoneCap 通道不可用")
+        return False
+
+    base = (os.environ.get("NONECAP_BASE_URL")
+            or "https://api.nonecap.com/v1").rstrip("/")
+    np_proxy = (os.environ.get("NONECAP_PROXY") or "").strip() or None
+    hdr = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
+    page_url = SERVER_URL.format(sid)
+    sid_i = int(sid) if str(sid).isdigit() else 0
+
+    # ---- 1. renew/start 探针：拿 allowed 与 hcaptchaSiteKey ----
+    try:
+        probe = sb.driver.execute_async_script(JS_RENEW_START, sid_i)
+    except Exception as e:
+        print("  [WARN] renew/start 探针失败: %s: %s" % (type(e).__name__, e))
+        return False
+    print("  [INFO] renew/start: %s" % str(probe)[:220])
+    if '"allowed":true' not in str(probe).replace(" ", ""):
+        print("  [INFO] 站点当前不可续期（冷却/限流），NoneCap 通道跳过")
+        return False
+
+    sitekey = ""
+    m = re.search(r'hcaptchaSiteKey\\?"?:\\?"?([0-9a-fA-F-]{36})', str(probe))
+    if m:
+        sitekey = m.group(1)
+    if not sitekey:
+        print("  [WARN] renew/start 未返回 hcaptchaSiteKey")
+        return False
+    print("  [INFO] hCaptcha sitekey: %s" % sitekey)
+
+    # ---- 2. NoneCap 出 token ----
+    try:
+        ua = sb.execute_script("return navigator.userAgent;") or ""
+    except Exception:
+        ua = ""
+    body = {"type": "hcaptcha", "sitekey": sitekey, "url": page_url}
+    if ua:
+        body["user_agent"] = ua
+    if np_proxy:
+        body["proxy"] = np_proxy
+    print("  [INFO] NoneCap 提交: sitekey=%s url=%s proxy=%s"
+          % (sitekey, page_url, "yes" if np_proxy else "no"))
+
+    t0 = time.time()
+    token = ""
+    try:
+        with httpx.Client(timeout=180) as cli:
+            r = cli.post(base + "/solves", params={"wait": 90},
+                         json=body, headers=hdr)
+            data = r.json() if r.content else {}
+            if r.status_code >= 400:
+                print("  [WARN] NoneCap %s: %s" % (r.status_code, str(data)[:240]))
+                if r.status_code in (401, 402):
+                    return False
+            solve_id = data.get("id")
+            token = data.get("token") or ""
+            status = data.get("status")
+            print("  [INFO] NoneCap 首包: status=%s id=%s" % (status, solve_id))
+            while not token and solve_id and time.time() - t0 < 240:
+                time.sleep(5)
+                r = cli.get(base + "/solves/" + str(solve_id),
+                            params={"wait": 30}, headers=hdr)
+                data = r.json() if r.content else {}
+                token = data.get("token") or ""
+                status = data.get("status")
+                print("  [INFO] NoneCap 轮询: status=%s" % status)
+                if status in ("failed", "cancelled", "expired"):
+                    print("  [WARN] NoneCap 失败: %s" % str(data.get("error"))[:200])
+                    return False
+    except Exception as e:
+        print("  [WARN] NoneCap 请求异常: %s: %s" % (type(e).__name__, e))
+        return False
+
+    if not token:
+        print("  [WARN] NoneCap 超时未出 token")
+        return False
+    print("  [INFO] NoneCap token: %s... (%d chars, %.0fs)"
+          % (token[:16], len(token), time.time() - t0))
+
+    # ---- 3. 直接打 renew ----
+    try:
+        res = sb.driver.execute_async_script(JS_RENEW_SUBMIT, sid_i, token)
+    except Exception as e:
+        print("  [WARN] renew API 调用失败: %s: %s" % (type(e).__name__, e))
+        return False
+
+    print("  [INFO] renew API 返回: %s" % str(res)[:300])
+    if '"success":true' in str(res).replace(" ", ""):
+        print("  [INFO] NoneCap 通道续期成功")
+        return True
+    print("  [WARN] NoneCap 通道未通过")
+    return False
+
+
+def solve_hcaptcha(sb, idx: int, sid_f: str = "", max_rounds: int = 6) -> bool:
+    """
+    hCaptcha 通道：
+      1. DP attach 同一浏览器，点 checkbox frame 里的勾选框
+      2. 无挑战 → token 直接产生
+      3. 出图像挑战 → 截挑战图 → AI 判出要点击的格子 → 逐格点击 → 提交
+      4. 每轮结束复查 token
+    """
+    # 首选：NoneCap API（第三方求解 + 直接打 renew 接口，最快最稳）
+    if _renew_by_nonecap(sb, sid, idx):
+        return True
+
+    # 次选：hcaptcha_challenger 库（Playwright 驱动，XHR 拦截 + 网格坐标）
+    if os.environ.get("HCAP_LIB", "1") == "1":
+        try:
+            if _solve_hcaptcha_via_lib(sb):
+                print("  [INFO] hCaptcha 已通过（hcaptcha_challenger）")
+                return True
+            print("  [INFO] hcaptcha_challenger 未通过，回退旧通道")
+        except Exception as e:
+            print(f"  [WARN] hcaptcha_challenger 异常: {e}")
+
+    print("  [INFO] 检测到 hCaptcha，走 AI 图像通道")
+
+    try:
+        from DrissionPage import ChromiumPage
+    except ImportError:
+        print("  [WARN] DrissionPage 未安装，hCaptcha 通道不可用")
+        return False
+
+    try:
+        dbg = (sb.driver.capabilities.get("goog:chromeOptions") or {}).get(
+            "debuggerAddress")
+        page = ChromiumPage(addr_or_opts=dbg) if dbg else ChromiumPage()
+    except Exception as e:
+        print(f"  [WARN] DrissionPage attach 失败: {e}")
+        return False
+
+    import base64
+    import random as _rnd
+
+    def snap_b64():
+        try:
+            path = OUTPUT_DIR / f"hcap_{sid_f}_{int(time.time())}.png"
+            page.get_screenshot(path=str(path))
+            return base64.b64encode(path.read_bytes()).decode(), path
+        except Exception as e:
+            print(f"  [WARN] 挑战截图失败: {e}")
+            return "", None
+
+    # 1. 点复选框
+    ck, _ = _hcap_frames(page)
+    if ck:
+        try:
+            box = ck.ele("#checkbox", timeout=5) or ck.ele(
+                ".checkbox", timeout=2)
+            if box:
+                page.actions.move_to(box, duration=_rnd.uniform(0.4, 0.9))
+                time.sleep(_rnd.uniform(0.2, 0.5))
+                try:
+                    box.click()
+                except Exception:
+                    box.click(by_js=True)
+                print("  [INFO] 已点击 hCaptcha 复选框")
+                time.sleep(4)
+        except Exception as e:
+            print(f"  [WARN] 复选框点击失败: {e}")
+    else:
+        print("  [WARN] 未找到 hCaptcha checkbox frame")
+
+    for round_i in range(1, max_rounds + 1):
+        if _hcap_passed(page):
+            print(f"  [INFO] hCaptcha 已通过（第 {round_i - 1} 轮后）")
+            return True
+
+        _, ch = _hcap_frames(page)
+        if not ch:
+            time.sleep(3)
+            if _hcap_passed(page):
+                print("  [INFO] hCaptcha 已通过")
+                return True
+            ck, _ = _hcap_frames(page)
+            if ck:
+                try:
+                    ck.ele("#checkbox", timeout=2).click()
+                except Exception:
+                    pass
+            continue
+
+        # 取题目文案
+        prompt = ""
+        try:
+            prompt = ch.run_js(
+                "return (document.querySelector("
+                "'.prompt-text, .challenge-prompt, h2') || {}).innerText || ''") or ""
+        except Exception:
+            pass
+        print(f"  [INFO] hCaptcha 第 {round_i} 轮，题目: {prompt[:80]!r}")
+
+        # 等挑战图真正渲染出来（题目先出、图后出，早截图会拍到半成品/未展开态）
+        for _w in range(20):
+            ready = False
+            try:
+                ready = bool(ch.run_js(
+                    "return !!(document.querySelector("
+                    "'canvas, .challenge-view img, .image-grid, "
+                    ".task-image, [class*=challenge] img'));"))
+            except Exception:
+                pass
+            if ready:
+                break
+            time.sleep(0.5)
+        time.sleep(1.2)
+
+        # 挑战图区域（challenge frame 内的可视框，视口坐标）
+        rect = None
+        try:
+            rect = ch.run_js("""
+                (function() {
+                    // 优先找挑战图像本体，其次整个 challenge 容器
+                    var cands = [
+                        ".challenge-view", ".image-grid", "#challenge-stage",
+                        ".challenge-container", ".task-grid", "canvas",
+                        "[class*=challenge] img"
+                    ];
+                    for (var i = 0; i < cands.length; i++) {
+                        var c = document.querySelector(cands[i]);
+                        if (!c) continue;
+                        var r = c.getBoundingClientRect();
+                        if (r.width > 120 && r.height > 80) {
+                            // 取整个挑战面板(含题库区)：向外扩到父级容器
+                            var p = c.closest(".challenge-container, form, body");
+                            var pr = (p || c).getBoundingClientRect();
+                            return {x: pr.left, y: pr.top,
+                                    w: pr.width, h: pr.height};
+                        }
+                    }
+                    return null;
+                })()
+            """)
+        except Exception:
+            rect = None
+        if not rect:
+            # 兜底：从主文档按 iframe 的 DOM 位置算（challenge 面板 = challenge iframe 本身）
+            try:
+                rect = sb.driver.execute_script("""
+                    var list = document.querySelectorAll(
+                        "iframe[src*='hcaptcha'], iframe[src*='challenge']");
+                    var best = null, area = 0;
+                    for (var i = 0; i < list.length; i++) {
+                        var r = list[i].getBoundingClientRect();
+                        if (r.width < 100 || r.height < 80) continue;
+                        var a = r.width * r.height;
+                        if (a > area) {
+                            area = a;
+                            best = {x: r.left, y: r.top,
+                                    w: r.width, h: r.height};
+                        }
+                    }
+                    return best;
+                """)
+            except Exception:
+                rect = None
+            if rect:
+                print(f"  [DEBUG] 用 iframe 包围盒: {rect}")
+        print(f"  [DEBUG] 挑战区域: {rect}")
+        if not rect:
+            try:
+                dbg_ifr = sb.driver.execute_script("""
+                    var out = [];
+                    document.querySelectorAll('iframe').forEach(function(f){
+                        var r = f.getBoundingClientRect();
+                        out.push([(f.src||'').slice(0,60), Math.round(r.left),
+                                  Math.round(r.top), Math.round(r.width),
+                                  Math.round(r.height)]);
+                    });
+                    return out;
+                """)
+                print(f"  [DEBUG] 页内 iframe 清单: {dbg_ifr}")
+            except Exception as e:
+                print(f"  [DEBUG] iframe 扫描失败: {e}")
+            try:
+                dbg_doc = ch.run_js(
+                    "return document.documentElement.outerHTML.slice(0, 600)")
+                print(f"  [DEBUG] challenge frame HTML: {dbg_doc}")
+            except Exception as e:
+                print(f"  [DEBUG] frame HTML 失败: {e}")
+
+        # 采多帧（动态题如「移动的动物没去过的岛」需要看运动过程）
+        frames = []
+        n_frames = 5
+        for fi in range(n_frames):
+            fb, _fp = snap_b64()
+            if fb and rect:
+                try:
+                    import base64 as _b64f
+                    import io as _iof
+
+                    from PIL import Image as _Imf
+                    imf = _Imf.open(_iof.BytesIO(_b64f.b64decode(fb)))
+                    pad = 12
+                    box = (max(0, int(rect["x"]) - pad),
+                           max(0, int(rect["y"]) - pad),
+                           min(imf.size[0], int(rect["x"] + rect["w"]) + pad),
+                           min(imf.size[1], int(rect["y"] + rect["h"]) + pad))
+                    crop = imf.crop(box)
+                    buf = _iof.BytesIO()
+                    crop.save(buf, format="PNG")
+                    fb = _b64f.b64encode(buf.getvalue()).decode()
+                except Exception as e:
+                    print(f"  [DEBUG] 裁剪失败: {e}")
+            if fb:
+                frames.append(fb)
+            if fi < n_frames - 1:
+                time.sleep(0.6)
+        if not frames:
+            time.sleep(3)
+            continue
+        print(f"  [INFO] 采集 {len(frames)} 帧")
+
+        clicks = []
+
+        # 路径 A：仅「找出不一样的图标」这类静态题才用色块算法（其他题一律交给 AI）
+        if rect and ("different" in (prompt or "").lower()
+                     or "不同" in (prompt or "")):
+            point = _hcap_odd_icon_point(
+                frames[-1],
+                None if not rect else (rect["x"], rect["y"],
+                                       rect["w"], rect["h"]))
+            if point:
+                px_, py_ = point
+                if rect:
+                    px_ += rect["x"]
+                    py_ += rect["y"]
+                print(f"  [INFO] 图像算法命中: ({px_:.0f},{py_:.0f})")
+                clicks = [(px_, py_)]
+
+        # 路径 B：AI 多帧理解 → 直接给像素坐标
+        if not clicks:
+            rinfo = "（截图已被裁剪到挑战面板范围）"
+            first = frames[0]
+            try:
+                import base64 as _b64
+                import io
+
+                from PIL import Image
+                im = Image.open(io.BytesIO(_b64.b64decode(first)))
+                size_txt = f"整图尺寸 {im.size[0]}x{im.size[1]}"
+            except Exception:
+                size_txt = "整图尺寸未知"
+            ask = (
+                f"下面 {len(frames)} 张图是同一个验证挑战按时间顺序的连续帧。"
+                f"{size_txt}；{rinfo}。\n"
+                f"任务描述：{prompt!r}\n\n"
+                "请直接输出结果，不要写分析过程。"
+                "click 类给 1 个点；drag 类给 2 个点（起点、终点）。\n"
+                "只输出一行 JSON：" 
+                "{\"action\":\"click\",\"points\":[[x,y]]} 或 "
+                "{\"action\":\"drag\",\"points\":[[x1,y1],[x2,y2]]}。"
+                "坐标是图中像素位置。"
+            )
+            ans = _ai_vision(ask, frames)
+            print(f"  [INFO] AI 回答: {ans[:260]!r}")
+            import json as _json
+            import re as _re
+            ai_action = "click"
+            _m2 = _re.search(r'"action"\s*:\s*"(\w+)"', ans)
+            if _m2:
+                ai_action = _m2.group(1).lower()
+            if "drag" in (prompt or "").lower() or "拖" in (prompt or ""):
+                ai_action = "drag"
+            # 容错解析坐标：先严格 JSON，失败则正则抓所有 [x,y]
+            # 只在「含 points 的 JSON 片段」里解析，避免抓到推理正文里的序号
+            for _mm in _re.finditer(r"\{[^{}]*\"points\"[^{}]*\}", ans, _re.S):
+                try:
+                    d = _json.loads(_mm.group(0))
+                    for p in d.get("points", []):
+                        if (isinstance(p, (list, tuple)) and len(p) == 2
+                                and all(isinstance(v, (int, float)) for v in p)):
+                            clicks.append((float(p[0]), float(p[1])))
+                except Exception:
+                    continue
+            if not clicks:
+                # 兜底：只认 [x,y] 且 x,y 都是 3 位以上数字（坐标量级）
+                pts = _re.findall(r"\[\s*(\d{2,4})\s*,\s*(\d{2,4})\s*\]", ans)
+                for a_, b_ in pts[:4]:
+                    clicks.append((float(a_), float(b_)))
+                if clicks:
+                    print(f"  [INFO] 正则兜底解析出 {len(clicks)} 点")
+            if rect and clicks:
+                ox, oy = max(0, int(rect["x"]) - 12), max(0, int(rect["y"]) - 12)
+                clicks = [(x_ + ox, y_ + oy) for (x_, y_) in clicks]
+                print(f"  [DEBUG] 裁剪偏移还原 +({ox},{oy})")
+            if ai_action == "drag" and len(clicks) >= 2:
+                _drag = (clicks[0], clicks[1])
+                clicks = []
+                print(f"  [INFO] 拖拽 {_drag[0]} → {_drag[1]}")
+            else:
+                _drag = None
+            # 兜底：AI 只给了格子号
+            if not clicks and rect:
+                nums = [int(n) for n in _re.findall(r"\b([1-9])\b", ans)]
+                if nums:
+                    cols = rows = 3
+                    cw, chh = rect["w"] / cols, rect["h"] / rows
+                    for n in nums[:3]:
+                        r_, c_ = divmod(n - 1, cols)
+                        clicks.append((rect["x"] + c_ * cw + cw / 2,
+                                       rect["y"] + r_ * chh + chh / 2))
+                    print(f"  [INFO] 按格子号换算 {nums}")
+
+        # 校验坐标在裁剪图尺寸范围内
+        if clicks:
+            try:
+                import base64 as _b64v
+                import io as _iov
+
+                from PIL import Image as _Imv
+                _sz = _Imv.open(_iov.BytesIO(_b64v.b64decode(frames[0]))).size
+                bad = [c for c in clicks
+                       if not (0 <= c[0] <= _sz[0] and 0 <= c[1] <= _sz[1])]
+                if bad:
+                    print(f"  [WARN] {len(bad)} 个坐标越界 {bad[:2]}，丢弃")
+                    clicks = [c for c in clicks if c not in bad]
+            except Exception:
+                pass
+
+        if not clicks:
+            print("  [WARN] 未能定位目标,刷新挑战")
+            try:
+                ch.ele("#refresh-button, .refresh-button", timeout=2).click()
+            except Exception:
+                pass
+            time.sleep(3)
+            continue
+
+        if locals().get("_drag"):
+            (x1, y1), (x2, y2) = _drag
+            try:
+                sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                    "type": "mousePressed", "x": float(x1), "y": float(y1),
+                    "button": "left", "clickCount": 1})
+                steps = 12
+                for s_ in range(1, steps + 1):
+                    mx = x1 + (x2 - x1) * s_ / steps
+                    my = y1 + (y2 - y1) * s_ / steps
+                    sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                        "type": "mouseMoved", "x": float(mx), "y": float(my),
+                        "button": "left"})
+                    time.sleep(0.03)
+                sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                    "type": "mouseReleased", "x": float(x2), "y": float(y2),
+                    "button": "left", "clickCount": 1})
+                print("  [INFO] 拖拽完成")
+            except Exception as e:
+                print(f"  [WARN] 拖拽失败: {e}")
+            time.sleep(2.0)
+
+        for (x, y) in clicks:
+            print(f"  [INFO] 点击 ({x:.0f},{y:.0f})")
+            ok_click = False
+            # 优先 CDP 顶层派发（视口坐标，跨 OOPIF 也准）
+            try:
+                for t_ in ("mousePressed", "mouseReleased"):
+                    sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                        "type": t_, "x": float(x), "y": float(y),
+                        "button": "left", "clickCount": 1})
+                ok_click = True
+            except Exception as e:
+                print(f"  [WARN] CDP 点击失败: {e}")
+            if not ok_click:
+                try:
+                    page.actions.move_to((int(x), int(y)),
+                                         duration=_rnd.uniform(0.2, 0.4))
+                    time.sleep(_rnd.uniform(0.15, 0.35))
+                    page.actions.click((int(x), int(y)))
+                except Exception as e:
+                    print(f"  [WARN] DP 点击失败: {e}")
+            time.sleep(_rnd.uniform(0.5, 0.9))
+
+        time.sleep(2)
+        try:
+            v = ch.ele("#submit-button, .submit-button", timeout=3)
+            if v:
+                v.click()
+                print("  [INFO] 已提交 hCaptcha 答案")
+        except Exception as e:
+            print(f"  [WARN] 提交失败: {e}")
+        time.sleep(5)
+
+        if _hcap_passed(page):
+            print("  [INFO] hCaptcha 已通过（AI 通道）")
+            return True
+
+    print("  [WARN] hCaptcha 未通过")
+    return False
+
+
 def solve_recaptcha_audio(sb, idx: int, max_attempts: int = 3) -> bool:
     """
     reCAPTCHA 语音挑战全流程（DrissionPage 版）：
@@ -1365,7 +2197,9 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
         src = sb.get_page_source() or ""
     except Exception:
         src = ""
-    if "challenges.cloudflare.com" in src or "cf-turnstile" in src:
+    if "hcaptcha.com" in src or "h-captcha" in src or "hcaptcha-widget-id" in src:
+        kind = "hcaptcha"
+    elif "challenges.cloudflare.com" in src or "cf-turnstile" in src:
         kind = "turnstile"
     elif "recaptcha" in src or "g-recaptcha" in src:
         kind = "recaptcha"
@@ -1380,7 +2214,9 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
             src = sb.get_page_source() or ""
         except Exception:
             src = ""
-        if "challenges.cloudflare.com" in src or "cf-turnstile" in src:
+        if "hcaptcha.com" in src or "h-captcha" in src or "hcaptcha-widget-id" in src:
+            kind = "hcaptcha"
+        elif "challenges.cloudflare.com" in src or "cf-turnstile" in src:
             kind = "turnstile"
         elif "recaptcha" in src or "g-recaptcha" in src:
             kind = "recaptcha"
@@ -1412,6 +2248,21 @@ def handle_turnstile(sb, idx: int, sid_f: str) -> bool:
                 print(f"  [DEBUG] iframe: src={f.get('src','')} title={f.get('title','')} {f.get('w')}x{f.get('h')}")
         except Exception as e:
             print(f"  [DEBUG] iframe 扫描失败: {e}")
+
+    # ==========================================================
+    # 分支 0：hCaptcha（H-CAP 盾）
+    # 复选框 → 无障碍直接过；出图像挑战则截图交 AI 判点位点击
+    # ==========================================================
+    if kind == "hcaptcha":
+        ok = solve_hcaptcha(sb, idx, sid_f)
+        safe_screenshot(sb, shot(idx, f"server_{sid_f}_hcaptcha"))
+        if ok:
+            return True
+        if not check_renew_modal_open(sb):
+            print("  [INFO] 弹窗已关闭，续期已提交")
+            return True
+        print("  [WARN] hCaptcha 通道未通过")
+        return False
 
     # ==========================================================
     # 分支 1：reCAPTCHA（CF 盾已换成 RE 盾）
