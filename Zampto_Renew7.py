@@ -1173,6 +1173,7 @@ def _renew_by_nonecap(sb, sid: str, idx: int = 0, real_sid=None) -> bool:
         HC_MODE           nc（默认）/ lib / off
     """
     if os.environ.get("HC_MODE", "nc") != "nc":
+        print("  [INFO] HC_MODE=%s，跳过 NoneCap" % os.environ.get("HC_MODE"))
         return False
     key = os.environ.get("NONECAP_API_KEY", "").strip()
     if not key:
@@ -1201,6 +1202,13 @@ def _renew_by_nonecap(sb, sid: str, idx: int = 0, real_sid=None) -> bool:
         probe = sb.driver.execute_async_script(JS_RENEW_START, sid_i)
     except Exception as e:
         print("  [WARN] renew/start 探针失败: %s: %s" % (type(e).__name__, e))
+        if os.environ.get("NONECAP_DEBUG") == "1":
+            try:
+                print("  [DEBUG] url=%s" % sb.get_current_url())
+                print("  [DEBUG] has_token=%s" %
+                      bool(sb.execute_script("return !!document.body")))
+            except Exception as e2:
+                print("  [DEBUG] 连 get_current_url 也失败: %r" % (e2,))
         return False
     print("  [INFO] renew/start: %s" % str(probe)[:220])
     if '"allowed":true' not in str(probe).replace(" ", ""):

@@ -318,11 +318,13 @@ jobs:
           # HC_MODE: nc=NoneCap 优先（默认）| lib=本地图像库 | off=关闭
           HC_MODE: ${{ vars.HC_MODE || 'nc' }}
           NONECAP_API_KEY: ${{ secrets.NONECAP_API_KEY }}
+          NONECAP_DEBUG: '1'
           # NONECAP_PROXY 通常留空：NoneCap 从自己服务器出网，
           # 传本地 127.0.0.1 代理会被拒
           NONECAP_PROXY: ${{ secrets.NONECAP_PROXY }}
           # ── 本地图像库兜底（HC_MODE=lib 时才需要）───────────────
           HCAP_LIB: ${{ vars.HCAP_LIB || '1' }}
+          DEBUG_SELENIUM: '1'
           OPENAI_BASE_URL: ${{ secrets.HCAP_OPENAI_BASE_URL }}
           OPENAI_API_KEY: ${{ secrets.HCAP_OPENAI_API_KEY }}
           OPENAI_MODEL: ${{ vars.HCAP_OPENAI_MODEL }}
